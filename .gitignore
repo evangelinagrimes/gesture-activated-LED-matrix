@@ -1,3 +1,4 @@
 *.task
 .venv/
 __pycache__/
+esp32_connection.log

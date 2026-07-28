@@ -75,6 +75,32 @@ void sendStatus(const String& message) {
   udp.endPacket();
 }
 
+// The subnet broadcast address (e.g. 192.168.8.255), computed from the
+// current IP/mask rather than hardcoded so it still works if the router's
+// subnet ever changes.
+IPAddress broadcastAddress() {
+  IPAddress ip = WiFi.localIP();
+  IPAddress mask = WiFi.subnetMask();
+  IPAddress bcast;
+  for (int i = 0; i < 4; i++) {
+    bcast[i] = ip[i] | (~mask[i] & 0xFF);
+  }
+  return bcast;
+}
+
+// Like sendStatus(), but also broadcasts on the local subnet. gesture.py's
+// UDP listener accepts a datagram from any address, so this reaches it even
+// if haveSender is still false (no gesture has ever been sent this boot) --
+// used only for the handful of messages that matter for the connection log
+// (boot diagnostics, reconnect summaries) even on a session with no gestures.
+void broadcastStatus(const String& message) {
+  sendStatus(message);
+  udp.beginPacket(broadcastAddress(), REPLY_PORT);
+  udp.print(message);
+  udp.print("\n");
+  udp.endPacket();
+}
+
 void setColor(uint8_t r, uint8_t g, uint8_t b) {
   DEBUG_PRINT("setColor() R=");
   DEBUG_PRINT(r);
@@ -133,39 +159,39 @@ void printHeartbeat() {
 // symptoms (BEACON_TIMEOUT, HANDSHAKE_TIMEOUT) so Serial output gives a real
 // lead instead of just "disconnected".
 String wifiDisconnectReasonToString(uint8_t reason) {
+  String prefix = "reason " + String(reason) + " ";
   switch (reason) {
-    case 2:   return "AUTH_EXPIRE (router expired our authentication)";
-    case 3:   return "AUTH_LEAVE";
-    case 4:   return "ASSOC_EXPIRE (router expired our association, e.g. idle timeout)";
-    case 5:   return "ASSOC_TOOMANY (router hit its client limit)";
-    case 8:   return "ASSOC_LEAVE (we or the router tore down the association)";
-    case 15:  return "4WAY_HANDSHAKE_TIMEOUT (weak signal or wrong password)";
-    case 200: return "BEACON_TIMEOUT (missed router beacons -- weak signal, interference, or the MCU stalled from a power sag)";
-    case 201: return "NO_AP_FOUND (SSID not visible -- router down, out of range, or wrong band)";
-    case 202: return "AUTH_FAIL (password rejected)";
-    case 203: return "ASSOC_FAIL";
-    case 204: return "HANDSHAKE_TIMEOUT";
-    case 205: return "CONNECTION_FAIL";
-    default:  return "code " + String(reason) + " (see wifi_err_reason_t)";
+    case 2:   return prefix + "AUTH_EXPIRE (router expired our authentication)";
+    case 3:   return prefix + "AUTH_LEAVE";
+    case 4:   return prefix + "ASSOC_EXPIRE (router expired our association, e.g. idle timeout)";
+    case 5:   return prefix + "ASSOC_TOOMANY (router hit its client limit)";
+    case 8:   return prefix + "ASSOC_LEAVE (we or the router tore down the association)";
+    case 15:  return prefix + "4WAY_HANDSHAKE_TIMEOUT (weak signal or wrong password)";
+    case 200: return prefix + "BEACON_TIMEOUT (missed router beacons -- weak signal, interference, or the MCU stalled from a power sag)";
+    case 201: return prefix + "NO_AP_FOUND (SSID not visible -- router down, out of range, or wrong band)";
+    case 202: return prefix + "AUTH_FAIL (password rejected)";
+    case 203: return prefix + "ASSOC_FAIL";
+    case 204: return prefix + "HANDSHAKE_TIMEOUT";
+    case 205: return prefix + "CONNECTION_FAIL";
+    default:  return prefix + "(see wifi_err_reason_t)";
   }
 }
 
-// Printed once at boot. ESP_RST_BROWNOUT is the smoking gun for a power
-// sag (the 3.3V rail dipping below the brownout threshold, usually because
-// a USB port/cable can't supply the ~500mA the radio draws on TX bursts);
-// ESP_RST_POWERON just means a normal cold boot.
-void printResetReason() {
-  Serial.print("Reset reason: ");
+// ESP_RST_BROWNOUT is the smoking gun for a power sag (the 3.3V rail
+// dipping below the brownout threshold, usually because a USB port/cable
+// can't supply the ~500mA the radio draws on TX bursts); ESP_RST_POWERON
+// just means a normal cold boot.
+String resetReasonString() {
   switch (esp_reset_reason()) {
-    case ESP_RST_POWERON:   Serial.println("power-on"); break;
-    case ESP_RST_BROWNOUT:  Serial.println("BROWNOUT -- check your 5V supply/cable, this is a power problem, not a WiFi one"); break;
-    case ESP_RST_PANIC:     Serial.println("software panic/crash"); break;
+    case ESP_RST_POWERON:   return "power-on";
+    case ESP_RST_BROWNOUT:  return "BROWNOUT -- check your 5V supply/cable, this is a power problem, not a WiFi one";
+    case ESP_RST_PANIC:     return "software panic/crash";
     case ESP_RST_INT_WDT:
     case ESP_RST_TASK_WDT:
-    case ESP_RST_WDT:       Serial.println("watchdog timeout"); break;
-    case ESP_RST_DEEPSLEEP: Serial.println("woke from deep sleep"); break;
-    case ESP_RST_SW:        Serial.println("software reset (e.g. esp_restart())"); break;
-    default:                Serial.println("code " + String((int)esp_reset_reason())); break;
+    case ESP_RST_WDT:       return "watchdog timeout";
+    case ESP_RST_DEEPSLEEP: return "woke from deep sleep";
+    case ESP_RST_SW:        return "software reset (e.g. esp_restart())";
+    default:                return "code " + String((int)esp_reset_reason());
   }
 }
 
@@ -226,6 +252,13 @@ void connectWiFi() {
   Serial.println(WiFi.localIP());
   Serial.print("Set ESP32_HOST in gesture.py to: ");
   Serial.println(WiFi.localIP());
+
+  // Broadcast (not just unicast) so gesture.py's connection log picks this
+  // up even if it hasn't sent a gesture yet this session -- this is the
+  // one place the boot-time reset reason (brownout vs normal) ever leaves
+  // the board.
+  broadcastStatus("ESP32 booted. WiFi ready, IP=" + WiFi.localIP().toString() +
+                   ". Reset reason: " + resetReasonString());
 }
 
 // Call every loop() iteration. Detects a dropped WiFi connection, pulses a
@@ -249,18 +282,26 @@ void maintainWiFi() {
       Serial.println(WiFi.localIP());
       udp.begin(LISTEN_PORT);  // rebind -- the network interface reset under us
       wifiWasConnected = true;
-      sendStatus("WiFi reconnected after " + String(reconnectAttempts) +
-                 " attempt(s), down for " + String(downtimeS) + "s");
+      // broadcastStatus, not sendStatus: this is the main thing the
+      // connection log needs, so it must reach gesture.py even if no
+      // gesture has ever been sent (haveSender still false).
+      broadcastStatus("WiFi reconnected after " + String(reconnectAttempts) +
+                       " attempt(s), down for " + String(downtimeS) + "s. Last disconnect " +
+                       wifiDisconnectReasonToString(lastDisconnectReason));
       reconnectAttempts = 0;
     }
     return;
   }
 
   if (wifiWasConnected) {
-    Serial.println("WiFi connection lost. Attempting to reconnect...");
     disconnectedSince = millis();
     reconnectAttempts = 0;
     wifiWasConnected = false;
+    // broadcastStatus() prints to Serial too, so this alone covers what
+    // used to be a separate Serial.println() here. Best-effort over UDP --
+    // the link may already be too far gone to actually deliver it, but if
+    // the drop is graceful it can still get out.
+    broadcastStatus("WiFi connection lost, attempting to reconnect...");
   }
 
   updateReconnectPulse();
@@ -289,7 +330,8 @@ void setup() {
   delay(1000);
 
   Serial.println("ESP32 Gesture LED Controller starting...");
-  printResetReason();
+  Serial.print("Reset reason: ");
+  Serial.println(resetReasonString());
 
   pixels.begin();
   setColor(0, 0, 0);  // Start with LEDs off

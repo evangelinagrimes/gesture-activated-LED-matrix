@@ -56,6 +56,11 @@ reply to whatever address/port a gesture datagram arrived from (the
 standard UDP request/reply pattern), or push a datagram to
 LOCAL_UDP_PORT unsolicited at any time, e.g. a boot/WiFi-connected
 message before this script has sent any gesture yet.
+
+Connection drops/recoveries (from both the ESP32's own UDP status lines
+and an independent ICMP ping check) are appended to esp32_connection.log
+next to this script, so a drop that happens unattended can still be
+diagnosed afterward -- see CONNECTION_LOG_PATH.
 --------------------------------------------------------------------------
 """
 
@@ -65,6 +70,9 @@ import re
 import time
 import atexit
 import socket
+import logging
+import subprocess
+import threading
 import urllib.request
 
 import cv2
@@ -125,6 +133,13 @@ ESP32_RECONNECT_INTERVAL_S = 5.0
 # downtime, sent once right after it reconnects) before reverting to the
 # normal gesture status line.
 RECONNECT_NOTE_DISPLAY_S = 5.0
+# How often the background thread pings ESP32_HOST at the OS/ICMP level.
+# This is independent of the UDP heartbeat: if the ESP32 has actually
+# dropped off the network (vs. just gone quiet at the app layer), ICMP will
+# fail immediately rather than waiting out ESP32_TIMEOUT_S, and it also
+# still works if the ESP32's firmware is wedged but the network stack isn't.
+PING_INTERVAL_S = 3.0
+PING_TIMEOUT_MS = 1000
 
 # Canned categories from MediaPipe's pretrained gesture recognizer. The
 # unmapped ones ("None", "Pointing_Up", "ILoveYou") fall through to the
@@ -156,6 +171,79 @@ last_esp32_contact = None  # time.monotonic() of the last datagram received from
 RECONNECT_REPORT_RE = re.compile(r"^WiFi reconnected after (\d+) attempt")
 last_reconnect_report = None      # (attempts: int, message: str) from the ESP32's own count
 last_reconnect_report_time = None  # time.monotonic() it arrived
+
+# Persistent record of connection failures/recoveries, independent of the
+# on-screen overlay, so a drop that happens while no one's watching the
+# window can still be diagnosed afterward. Kept separate from the console
+# print()s (which include high-frequency stuff like heartbeats/gestures) --
+# this file is connection-events only.
+CONNECTION_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "esp32_connection.log")
+conn_logger = logging.getLogger("esp32_connection")
+conn_logger.setLevel(logging.INFO)
+conn_logger.propagate = False
+_log_handler = logging.FileHandler(CONNECTION_LOG_PATH)
+_log_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+conn_logger.addHandler(_log_handler)
+
+# Any ESP32 status line containing one of these (case-insensitive) is
+# connection-relevant and gets a copy in CONNECTION_LOG_PATH, not just the
+# console. Matches the wording used in gesture-esp.ino's broadcastStatus()
+# calls (boot/reset-reason, "WiFi connection lost", "WiFi reconnected...").
+CONNECTION_LOG_KEYWORDS = ("wifi", "reset reason")
+
+
+def _is_connection_related(line: str) -> bool:
+    lower = line.lower()
+    return any(keyword in lower for keyword in CONNECTION_LOG_KEYWORDS)
+
+
+# --- Independent ICMP ping monitor --------------------------------------
+# Runs on its own thread so it never blocks the frame loop. This is
+# deliberately separate from the UDP-heartbeat-based esp32_seems_connected()
+# check above: that one only tells you the *application* has gone quiet,
+# which can't distinguish "ESP32 fell off the network" from "ESP32 is alive
+# but its UDP send is failing" -- a raw ICMP ping tells you whether the host
+# is reachable on the network at all, independent of anything the ESP32
+# firmware is doing.
+ping_ok = None  # None = no ping attempted yet
+_ping_lock = threading.Lock()
+_ping_stop = threading.Event()
+
+
+def _ping_once(host: str, timeout_ms: int) -> bool:
+    if os.name == "nt":
+        cmd = ["ping", "-n", "1", "-w", str(timeout_ms), host]
+    else:
+        cmd = ["ping", "-c", "1", "-W", str(max(1, timeout_ms // 1000)), host]
+    try:
+        result = subprocess.run(
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=(timeout_ms / 1000) + 2,
+        )
+        return result.returncode == 0
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+
+
+def ping_monitor_loop():
+    """Background thread body: ping ESP32_HOST periodically, logging transitions."""
+    global ping_ok
+    while not _ping_stop.is_set():
+        ok = _ping_once(ESP32_HOST, PING_TIMEOUT_MS)
+        with _ping_lock:
+            first_result = ping_ok is None
+            changed = not first_result and ok != ping_ok
+            ping_ok = ok
+        if first_result:
+            conn_logger.info(f"[PING] Initial check: {ESP32_HOST} is "
+                              f"{'reachable' if ok else 'NOT reachable'}")
+        elif changed:
+            if ok:
+                conn_logger.info(f"[PING] {ESP32_HOST} is reachable again")
+            else:
+                conn_logger.warning(f"[PING] {ESP32_HOST} stopped responding to ICMP "
+                                     f"(host off the network, WiFi dropped, or ICMP blocked)")
+        _ping_stop.wait(PING_INTERVAL_S)
 
 
 def open_esp32_link():
@@ -226,6 +314,8 @@ def read_esp32_output():
         line = data.decode("utf-8", errors="ignore").strip()
         if line:
             print(f"[ESP32] {line}")
+            if _is_connection_related(line):
+                conn_logger.info(f"[ESP32] {line}")
             match = RECONNECT_REPORT_RE.match(line)
             if match:
                 last_reconnect_report = (int(match.group(1)), line)
@@ -418,6 +508,11 @@ def main():
     open_esp32_link()
     atexit.register(close_esp32_link)
 
+    conn_logger.info(f"Session started. Connection events for {ESP32_HOST} logged to {CONNECTION_LOG_PATH}")
+    ping_thread = threading.Thread(target=ping_monitor_loop, daemon=True)
+    ping_thread.start()
+    atexit.register(_ping_stop.set)
+
     base_options = mp_python.BaseOptions(model_asset_path=MODEL_PATH)
     options = vision.GestureRecognizerOptions(
         base_options=base_options,
@@ -441,6 +536,7 @@ def main():
     last_timestamp_ms = 0
     last_sent_gesture = None
     esp32_was_connected = False  # tracks the previous frame's state, to log the transition once
+    esp32_ever_dropped = False  # guards the "reachable again" log so it doesn't fire on first-ever contact
     debouncer = GestureDebouncer(GESTURE_STABLE_FRAMES)
 
     try:
@@ -503,8 +599,15 @@ def main():
 
             esp32_connected = esp32_seems_connected()
             if esp32_connected is False and esp32_was_connected:
-                print(f"Warning: ESP32 has not responded in over {ESP32_TIMEOUT_S:.0f}s "
-                      f"-- check its WiFi connection and power.")
+                msg = f"ESP32 has not responded in over {ESP32_TIMEOUT_S:.0f}s -- check its WiFi connection and power."
+                print(f"Warning: {msg}")
+                conn_logger.warning(f"[UDP] {msg}")
+                esp32_ever_dropped = True
+            elif esp32_connected and not esp32_was_connected and esp32_ever_dropped:
+                # Guarded by esp32_ever_dropped so this doesn't fire on the
+                # very first contact of the session (not a "recovery").
+                conn_logger.info("[UDP] ESP32 reachable again")
+                esp32_ever_dropped = False
             esp32_was_connected = bool(esp32_connected)
 
             if esp32_connected is None:
