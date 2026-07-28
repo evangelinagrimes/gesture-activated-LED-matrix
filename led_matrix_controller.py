@@ -87,6 +87,7 @@ import threading
 import urllib.request
 
 import cv2
+import numpy as np
 import mediapipe as mp
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision
@@ -104,15 +105,18 @@ ESP32_HOST = "192.168.8.182"   # <-- set to your ESP32's IP
 ESP32_PORT = 4210              # port the ESP32 listens on for gesture commands / images
 LOCAL_UDP_PORT = 4211          # port this script listens on for ESP32 debug messages
 
-# Must match NUMPIXELS in gesture-esp.ino -- also doubles as the exact byte
-# count an image datagram must be, since that's how the ESP32 tells an
-# image frame apart from a gesture command (see displayImage() there).
-NUMPIXELS = 256
+# Physical dimensions of the LED matrix. Their product must match NUMPIXELS
+# in gesture-esp.ino -- that's also the exact byte count an image datagram
+# must be, since that's how the ESP32 tells an image frame apart from a
+# gesture command (see displayImage() there).
+MATRIX_WIDTH = 16
+MATRIX_HEIGHT = 16
+NUMPIXELS = MATRIX_WIDTH * MATRIX_HEIGHT
 # Path to the hex-literal image to push with the 'i' key. Point this at
-# your own .h or .txt -- load_image_bytes() just scans for `0xNN` tokens,
-# so either a `const uint8_t image[] PROGMEM = {0xFF, ...};` style .h file
-# or a plain comma-separated hex dump works.
-IMAGE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "images", "example.h")
+# your own .h or .txt -- load_image_bytes() auto-detects the source image's
+# width/height and bit depth (see its docstring) and downsamples to the
+# matrix size, so the source doesn't need to already be 16x16.
+IMAGE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "images", "pic1.txt")
 
 # --- Tuning knobs -------------------------------------------------------
 # Minimum confidence from the pretrained recognizer before a gesture counts.
@@ -312,23 +316,106 @@ def send_gesture(gesture_name: str):
 # separated hex dump -- it just pulls out every `0xNN` token in the file.
 HEX_TOKEN_RE = re.compile(r"0[xX][0-9A-Fa-f]{2}")
 
+# Matches image2cpp-style `..._width = N;` / `..._height = N;` declarations
+# (any prefix, e.g. pic1_width, image_height) so the source resolution can
+# be recovered regardless of what the generator named its variables.
+WIDTH_RE = re.compile(r"\w*width\w*\s*=\s*(\d+)", re.IGNORECASE)
+HEIGHT_RE = re.compile(r"\w*height\w*\s*=\s*(\d+)", re.IGNORECASE)
+
+
+def _parse_dimensions(text: str):
+    """Return (width, height) from image2cpp-style declarations, or None if
+    the file has no such metadata (i.e. it's assumed to already be a flat
+    NUMPIXELS-byte dump matching the matrix 1:1)."""
+    w_match = WIDTH_RE.search(text)
+    h_match = HEIGHT_RE.search(text)
+    if not w_match or not h_match:
+        return None
+    return int(w_match.group(1)), int(h_match.group(1))
+
+
+def _detect_bit_depth(token_count: int, width: int, height: int) -> int:
+    """Infer pixels-per-byte packing from the byte count alone.
+
+    image2cpp (and similar tools) pack multiple low-bit-depth pixels per
+    byte, row-aligned (each row starts on a byte boundary, so a row whose
+    width isn't a multiple of the packing factor gets padded). Rather than
+    trust a possibly-wrong size comment in the source (the `/8` in these
+    files' `pic1_data[(w*h)/8]` declarations is arithmetically incorrect
+    for non-multiple-of-8 widths -- integer truncation), just check which
+    depth's *actual* row-padded size matches the real token count.
+    """
+    candidates = {
+        8: width * height,                # 1 byte/pixel, direct grayscale
+        4: ((width + 1) // 2) * height,    # 2 px/byte (4-bit grayscale)
+        1: ((width + 7) // 8) * height,    # 8 px/byte (1-bit monochrome)
+    }
+    for depth, expected in candidates.items():
+        if token_count == expected:
+            return depth
+    raise ValueError(
+        f"{token_count} hex byte(s) doesn't match any known packing for a "
+        f"{width}x{height} image (tried 8/4/1 bits per pixel: "
+        f"{candidates[8]}/{candidates[4]}/{candidates[1]} byte(s) expected)"
+    )
+
+
+def _unpack_bitmap(raw: bytes, width: int, height: int, bit_depth: int) -> np.ndarray:
+    """Expand a row-padded, MSB-first packed bitmap into an 8-bit HxW
+    grayscale array (0-255)."""
+    pixels_per_byte = 8 // bit_depth
+    row_bytes = -(-width // pixels_per_byte)  # ceil division
+    max_val = (1 << bit_depth) - 1
+    scale = 255 // max_val  # e.g. 1-bit -> 255, 4-bit -> 17, 8-bit -> 1
+
+    img = np.zeros((height, width), dtype=np.uint8)
+    for y in range(height):
+        row_start = y * row_bytes
+        for x in range(width):
+            byte_val = raw[row_start + x // pixels_per_byte]
+            shift = bit_depth * (pixels_per_byte - 1 - (x % pixels_per_byte))
+            img[y, x] = ((byte_val >> shift) & max_val) * scale
+    return img
+
 
 def load_image_bytes(path: str) -> bytes:
-    """Extract a flat grayscale byte-per-pixel image from a hex-literal file.
+    """Load a hex-literal image file and return exactly NUMPIXELS grayscale
+    bytes (one per LED, row-major), ready to hand to send_image().
 
-    Expects exactly NUMPIXELS bytes (one brightness value per LED, row-major)
-    -- raises ValueError with a count mismatch if the file doesn't match, so
-    a wrong/partial file fails loudly instead of drawing a corrupted image.
+    Supports two shapes of input:
+
+    - image2cpp-style: `..._width`/`..._height` declarations plus a packed
+      pixel array at 1, 4, or 8 bits per pixel (auto-detected from the byte
+      count -- see _detect_bit_depth()), row-aligned. The source image is
+      downsampled (area-averaged) or upsampled (nearest-neighbor) to
+      MATRIX_WIDTH x MATRIX_HEIGHT as needed -- it does not need to already
+      match the matrix's resolution.
+    - No width/height metadata found: assumed to already be a flat
+      NUMPIXELS-byte grayscale dump matching the matrix 1:1.
+
+    Either way, this just scans for `0xNN` tokens, so it doesn't care
+    whether the surrounding syntax is a C header or a bare hex dump.
     """
     with open(path, "r") as f:
         text = f.read()
-    values = [int(tok, 16) for tok in HEX_TOKEN_RE.findall(text)]
-    if len(values) != NUMPIXELS:
-        raise ValueError(
-            f"found {len(values)} hex byte(s), expected exactly {NUMPIXELS} "
-            f"(one grayscale byte per LED)"
-        )
-    return bytes(values)
+    raw = bytes(int(tok, 16) for tok in HEX_TOKEN_RE.findall(text))
+
+    dims = _parse_dimensions(text)
+    if dims is None:
+        if len(raw) != NUMPIXELS:
+            raise ValueError(
+                f"found {len(raw)} hex byte(s) and no width/height metadata, "
+                f"expected exactly {NUMPIXELS} (one grayscale byte per LED)"
+            )
+        return raw
+
+    width, height = dims
+    bit_depth = _detect_bit_depth(len(raw), width, height)
+    img = _unpack_bitmap(raw, width, height, bit_depth)
+
+    interpolation = cv2.INTER_AREA if (width, height) > (MATRIX_WIDTH, MATRIX_HEIGHT) else cv2.INTER_NEAREST
+    resized = cv2.resize(img, (MATRIX_WIDTH, MATRIX_HEIGHT), interpolation=interpolation)
+    return resized.astype(np.uint8).tobytes()
 
 
 def send_image(path: str = IMAGE_PATH):

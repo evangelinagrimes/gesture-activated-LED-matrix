@@ -58,17 +58,17 @@ Gestures the ESP32 doesn't recognize (`Pointing`, `OK Sign`, `Rock On`,
 ### Image display
 
 Point `IMAGE_PATH` (top of `led_matrix_controller.py`) at a hex-literal
-byte dump — either a C header like image2cpp's
-`const uint8_t image[] PROGMEM = {0xFF, 0xBF, ...};` or a plain
-comma-separated `.txt` — containing exactly `NUMPIXELS` (256) bytes: one
-grayscale brightness value per LED, row-major. `load_image_bytes()` just
-scans the file for `0xNN` tokens, so it doesn't care which of the two
-formats you use.
+image file — either an image2cpp-style C header/`.txt` (with
+`..._width`/`..._height` declarations and a 1/4/8-bit packed pixel array)
+or a flat 256-byte grayscale dump. The source image does **not** need to
+already be 16x16: `load_image_bytes()` parses its real resolution and bit
+depth and downsamples/upsamples it to the matrix size automatically. See
+[`images/README.md`](images/README.md) for the exact format details.
 
 Press `i` while the script is running to push it to the matrix as one raw
-UDP datagram. The ESP32 (`displayImage()` in `gesture-esp.ino`) tells this
-apart from a gesture command purely by packet size — a 256-byte datagram
-is always an image frame, never a gesture label.
+256-byte UDP datagram. The ESP32 (`displayImage()` in `gesture-esp.ino`)
+tells this apart from a gesture command purely by packet size — a
+256-byte datagram is always an image frame, never a gesture label.
 
 ## Hardware
 

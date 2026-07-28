@@ -4,21 +4,31 @@ Drop your hex-literal image file(s) here and point `IMAGE_PATH` (top of
 `led_matrix_controller.py`) at the one you want the `i` key to push to the
 matrix.
 
-Accepted format: either one works, since `load_image_bytes()` just scans
-the file for `0xNN` tokens and ignores everything else around them.
+`load_image_bytes()` accepts either:
 
-- A C header (image2cpp-style), e.g.:
+- **image2cpp-style, any resolution** — a `..._width`/`..._height`
+  declaration plus a packed pixel array at 1, 4, or 8 bits per pixel
+  (auto-detected from the byte count), e.g.:
 
   ```c
-  const uint8_t example[] PROGMEM = {
-      0xFF, 0xFF, 0xFF, 0xFF, /* ... */
-  };
+  const uint32_t pic1_width = 800;
+  const uint32_t pic1_height = 480;
+  const uint8_t pic1_data[...] = { 0xFF, 0xFF, /* ... */ };
   ```
 
-- A plain comma-separated `.txt` dump of the same bytes.
+  The source image does **not** need to already be 16x16 -- it's
+  automatically downsampled (area-averaged) or upsampled
+  (nearest-neighbor) to the matrix's resolution (`MATRIX_WIDTH` x
+  `MATRIX_HEIGHT`, 16x16 by default). This is the format image2cpp
+  (javl.github.io/image2cpp) and similar tools export.
 
-The file must contain **exactly 256** hex bytes — one grayscale
-brightness value per LED on the 16x16 matrix, row-major (left-to-right,
-top-to-bottom). `send_image()` will refuse to send anything that doesn't
-match that count, so a partial or wrongly-sized file fails loudly instead
-of drawing garbage.
+- **A flat 256-byte dump** — if the file has no width/height metadata,
+  it's assumed to already be exactly `NUMPIXELS` (256) grayscale bytes,
+  one per LED, row-major.
+
+Either way, the parser just scans the file for `0xNN` tokens, so it
+doesn't care whether the surrounding syntax is a `.h` C header or a plain
+comma-separated `.txt` dump.
+
+A wrong/unrecognized byte count raises an error naming exactly what was
+expected, rather than silently drawing a corrupted image.
