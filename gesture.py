@@ -1,7 +1,7 @@
 """
 Real-Time Hand Gesture Detection
 ==================================
-Uses MediaPipe's new Tasks API (HandLandmarker) + OpenCV to detect hand
+Uses MediaPipe's new Tasks API (GestureRecognizer) + OpenCV to detect hand
 gestures live from your webcam.
 
 NOTE: This uses mediapipe.tasks (the current, actively-maintained API),
@@ -12,16 +12,21 @@ many recent pip installs (see: github.com/google-ai-edge/mediapipe issues
 Install dependencies:
     pip install mediapipe opencv-python pyserial
 
-On first run, this script auto-downloads the hand landmark model file
-(hand_landmarker.task, ~7MB) into the same folder as this script.
+On first run, this script auto-downloads MediaPipe's pretrained gesture
+recognizer model file (gesture_recognizer.task, ~8MB) into the same folder
+as this script.
 
 Run:
     python3 gesture_detection.py
 
 Press 'q' to quit.
 
-Detected gestures: Fist, Open Palm, Thumbs Up, Thumbs Down, Peace Sign,
-Pointing (index finger), OK Sign, Rock On.
+Gesture classification is a hybrid: MediaPipe's pretrained recognizer
+handles Thumbs Up, Thumbs Down, Peace Sign, Open Palm, and Fist (each with
+a confidence score, gated by MIN_GESTURE_CONFIDENCE below). Anything it
+doesn't recognize falls back to hand-written geometric rules in
+`classify_gesture()`, which also cover a few extra gestures the pretrained
+model has no category for: Pointing, OK Sign, Rock On.
 
 You can extend `classify_gesture()` with your own logic/gestures.
 
@@ -41,7 +46,9 @@ sync with whatever the Arduino sketch switches on:
 
 Any gesture classified by `classify_gesture()` that isn't one of the
 above (e.g. "Pointing", "OK Sign", "Rock On", "Unknown") is reported to
-the ESP32 as "none".
+the ESP32 as "none". A gesture must hold steady for GESTURE_STABLE_FRAMES
+consecutive frames before it is sent, to avoid chattering the serial line
+on single-frame misclassifications.
 --------------------------------------------------------------------------
 """
 
@@ -57,16 +64,42 @@ import serial
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision
 
-MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hand_landmarker.task")
+MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gesture_recognizer.task")
 MODEL_URL = (
-    "https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
-    "hand_landmarker/float16/1/hand_landmarker.task"
+    "https://storage.googleapis.com/mediapipe-models/gesture_recognizer/"
+    "gesture_recognizer/float16/1/gesture_recognizer.task"
 )
 
 # Serial connection to the ESP32. On Windows this looks like "COM3"; on
 # Mac/Linux it looks like "/dev/tty.usbserial-XXXX" or "/dev/ttyUSB0".
 SERIAL_PORT = "COM4"
 BAUD_RATE = 115200
+
+# --- Tuning knobs -------------------------------------------------------
+# Minimum confidence from the pretrained recognizer before a gesture counts.
+# Lower  -> more responsive, more false positives.
+MIN_GESTURE_CONFIDENCE = 0.5
+# Lower these if hands aren't picked up in poor light or at a distance.
+MIN_HAND_DETECTION_CONFIDENCE = 0.5
+MIN_TRACKING_CONFIDENCE = 0.5
+# Consecutive frames a gesture must hold before it is sent to the ESP32.
+GESTURE_STABLE_FRAMES = 4
+# OK-sign pinch distance, as a fraction of hand size (scale-invariant).
+OK_SIGN_RATIO = 0.35
+# Minimum thumb offset from the wrist, as a fraction of hand size, before
+# committing to Thumbs Up vs Thumbs Down.
+THUMB_DIRECTION_MARGIN = 0.3
+
+# Canned categories from MediaPipe's pretrained gesture recognizer. The
+# unmapped ones ("None", "Pointing_Up", "ILoveYou") fall through to the
+# geometric rules in classify_gesture().
+MP_GESTURE_LABELS = {
+    "Thumb_Up": "thumbs_up",
+    "Thumb_Down": "thumbs_down",
+    "Victory": "peace",
+    "Open_Palm": "open_palm",
+    "Closed_Fist": "fist",
+}
 
 # Maps classify_gesture() output to the label strings the ESP32 expects.
 # Anything not listed here (e.g. "Pointing", "OK Sign", "Rock On",
@@ -139,9 +172,9 @@ FINGER_PIPS = [3, 6, 10, 14, 18]        # joint just below each tip
 
 
 def ensure_model():
-    """Download the hand landmark model file if it isn't already present."""
+    """Download the gesture recognizer model file if it isn't already present."""
     if not os.path.exists(MODEL_PATH):
-        print("Downloading hand landmark model (one-time, ~7MB)...")
+        print("Downloading hand gesture recognizer model (one-time, ~8MB)...")
         urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
         print("Model downloaded to", MODEL_PATH)
 
@@ -150,31 +183,42 @@ def distance(a, b):
     return math.hypot(a.x - b.x, a.y - b.y)
 
 
-def fingers_up(landmarks, handedness_label):
+def hand_scale(landmarks):
+    """Reference length (wrist -> middle-finger MCP) for normalizing distances."""
+    return max(distance(landmarks[0], landmarks[9]), 1e-6)
+
+
+def fingers_up(landmarks):
     """Return a list of booleans [thumb, index, middle, ring, pinky]
-    indicating whether each finger is extended."""
+    indicating whether each finger is extended.
+
+    Uses distance-from-palm rather than raw y-coordinates so this holds up
+    regardless of how the hand is rotated or tilted toward the camera.
+    """
     fingers = []
 
-    # Thumb: compare x-position relative to handedness (mirrored image)
-    if handedness_label == "Right":
-        fingers.append(landmarks[4].x < landmarks[3].x)
-    else:
-        fingers.append(landmarks[4].x > landmarks[3].x)
+    # Thumb: a folded thumb curls in toward the pinky side of the palm, so
+    # compare distance to the pinky MCP rather than the wrist.
+    palm_ref = landmarks[17]
+    fingers.append(distance(landmarks[4], palm_ref) > distance(landmarks[3], palm_ref))
 
-    # Other four fingers: tip above (smaller y) than pip joint = extended
+    # Other four fingers: extended when the tip is farther from the wrist
+    # than its pip joint is.
+    wrist = landmarks[0]
     for tip, pip in zip(FINGER_TIPS[1:], FINGER_PIPS[1:]):
-        fingers.append(landmarks[tip].y < landmarks[pip].y)
+        fingers.append(distance(landmarks[tip], wrist) > distance(landmarks[pip], wrist))
 
     return fingers
 
 
-def classify_gesture(landmarks, handedness_label):
-    f = fingers_up(landmarks, handedness_label)
+def classify_gesture(landmarks):
+    f = fingers_up(landmarks)
     thumb, index, middle, ring, pinky = f
     count_extended = sum(f)
+    scale = hand_scale(landmarks)
 
     # OK sign: thumb tip and index tip close together, other fingers extended
-    if distance(landmarks[4], landmarks[8]) < 0.05 and middle and ring and pinky:
+    if distance(landmarks[4], landmarks[8]) / scale < OK_SIGN_RATIO and middle and ring and pinky:
         return "OK Sign"
 
     if count_extended == 0:
@@ -188,13 +232,66 @@ def classify_gesture(landmarks, handedness_label):
     if thumb and pinky and not index and not middle and not ring:
         return "Rock On"
     if thumb and not index and not middle and not ring and not pinky:
-        # Thumb up vs down based on vertical position of thumb tip vs wrist
-        if landmarks[4].y < landmarks[0].y:
+        # Thumb up vs down based on vertical position of thumb tip vs wrist,
+        # with a deadband so a near-horizontal thumb doesn't get guessed at.
+        offset = landmarks[0].y - landmarks[4].y  # positive = thumb above wrist
+        margin = THUMB_DIRECTION_MARGIN * scale
+        if offset > margin:
             return "Thumbs Up"
-        else:
+        elif offset < -margin:
             return "Thumbs Down"
+        return "Unknown"
 
     return "Unknown"
+
+
+def resolve_gesture(gestures, landmarks):
+    """Return (esp32_label, display_text) for one hand.
+
+    Prefers the pretrained recognizer when it is confident; otherwise falls
+    back to the geometric rules, which cover the gestures it has no category
+    for (OK Sign, Rock On, Pointing).
+    """
+    if gestures:
+        top = gestures[0]  # highest-scoring category for this hand
+        if top.category_name in MP_GESTURE_LABELS and top.score >= MIN_GESTURE_CONFIDENCE:
+            return MP_GESTURE_LABELS[top.category_name], f"{top.category_name} {top.score:.2f}"
+
+    gesture = classify_gesture(landmarks)
+    return GESTURE_LABELS.get(gesture, "none"), gesture
+
+
+def pick_driving_hand(result):
+    """Index of the hand that should drive ESP32 output: the largest
+    apparent hand, i.e. the one nearest the camera."""
+    if not result.hand_landmarks:
+        return None
+    return max(range(len(result.hand_landmarks)),
+               key=lambda i: hand_scale(result.hand_landmarks[i]))
+
+
+class GestureDebouncer:
+    """Require the same label on N consecutive frames before it counts.
+
+    Filters single-frame misclassifications and brief tracking dropouts so
+    they don't chatter the ESP32 serial line.
+    """
+
+    def __init__(self, stable_frames):
+        self.stable_frames = stable_frames
+        self._candidate = None
+        self._run_length = 0
+        self._confirmed = None
+
+    def update(self, label):
+        if label == self._candidate:
+            self._run_length += 1
+        else:
+            self._candidate = label
+            self._run_length = 1
+        if self._run_length >= self.stable_frames:
+            self._confirmed = self._candidate
+        return self._confirmed
 
 
 # Hand connections for drawing (pairs of landmark indices), same topology
@@ -225,22 +322,24 @@ def main():
     atexit.register(close_serial)
 
     base_options = mp_python.BaseOptions(model_asset_path=MODEL_PATH)
-    options = vision.HandLandmarkerOptions(
+    options = vision.GestureRecognizerOptions(
         base_options=base_options,
         running_mode=vision.RunningMode.VIDEO,
         num_hands=2,
-        min_hand_detection_confidence=0.6,
-        min_tracking_confidence=0.6,
+        min_hand_detection_confidence=MIN_HAND_DETECTION_CONFIDENCE,
+        min_tracking_confidence=MIN_TRACKING_CONFIDENCE,
     )
-    landmarker = vision.HandLandmarker.create_from_options(options)
+    recognizer = vision.GestureRecognizer.create_from_options(options)
 
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         print("Error: could not open webcam.")
         return
 
-    frame_timestamp_ms = 0
+    start_time = time.perf_counter()
+    last_timestamp_ms = 0
     last_sent_gesture = None
+    debouncer = GestureDebouncer(GESTURE_STABLE_FRAMES)
 
     try:
         while cap.isOpened():
@@ -253,28 +352,33 @@ def main():
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
 
-            frame_timestamp_ms += 33  # roughly assumes ~30fps; must be increasing
-            result = landmarker.detect_for_video(mp_image, frame_timestamp_ms)
+            # Real elapsed time, forced strictly increasing (the VIDEO-mode
+            # tracker requires monotonically increasing timestamps).
+            timestamp_ms = max(int((time.perf_counter() - start_time) * 1000), last_timestamp_ms + 1)
+            last_timestamp_ms = timestamp_ms
+            result = recognizer.recognize_for_video(mp_image, timestamp_ms)
 
             esp32_gesture = "none"
+            driving_hand = pick_driving_hand(result)
 
             if result.hand_landmarks:
-                for landmarks, handedness in zip(result.hand_landmarks, result.handedness):
+                for i, (landmarks, handedness) in enumerate(zip(result.hand_landmarks, result.handedness)):
                     label = handedness[0].category_name  # "Left" / "Right"
-                    gesture = classify_gesture(landmarks, label)
+                    gestures = result.gestures[i] if i < len(result.gestures) else []
+                    esp32_label, display_text = resolve_gesture(gestures, landmarks)
 
-                    # Only the first detected hand drives the ESP32 output.
-                    if esp32_gesture == "none":
-                        esp32_gesture = GESTURE_LABELS.get(gesture, "none")
+                    if i == driving_hand:
+                        esp32_gesture = esp32_label
 
                     draw_landmarks(frame, landmarks)
 
                     h, w, _ = frame.shape
                     wrist = landmarks[0]
                     x, y = int(wrist.x * w), int(wrist.y * h)
+                    marker = "-> " if i == driving_hand else ""
                     cv2.putText(
                         frame,
-                        f"{label}: {gesture}",
+                        f"{marker}{label}: {display_text}",
                         (x - 40, y + 40),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.8,
@@ -283,11 +387,23 @@ def main():
                         cv2.LINE_AA,
                     )
 
-            if esp32_gesture != last_sent_gesture:
-                send_gesture(esp32_gesture)
-                last_sent_gesture = esp32_gesture
+            confirmed = debouncer.update(esp32_gesture)
+            if confirmed is not None and confirmed != last_sent_gesture:
+                send_gesture(confirmed)
+                last_sent_gesture = confirmed
 
             read_esp32_output()
+
+            cv2.putText(
+                frame,
+                f"ESP32: {last_sent_gesture or '...'}",
+                (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (0, 200, 255),
+                2,
+                cv2.LINE_AA,
+            )
 
             cv2.imshow("Gesture Detection (press 'q' to quit)", frame)
             if cv2.waitKey(5) & 0xFF == ord("q"):
@@ -295,7 +411,7 @@ def main():
     except KeyboardInterrupt:
         print("Interrupted, shutting down.")
     finally:
-        landmarker.close()
+        recognizer.close()
         cap.release()
         cv2.destroyAllWindows()
         read_esp32_output()  # flush any remaining buffered ESP32 messages
