@@ -10,7 +10,7 @@ many recent pip installs (see: github.com/google-ai-edge/mediapipe issues
 #6200, #6204, #6261). This version avoids that problem entirely.
 
 Install dependencies:
-    pip install mediapipe opencv-python pyserial
+    pip install mediapipe opencv-python
 
 On first run, this script auto-downloads MediaPipe's pretrained gesture
 recognizer model file (gesture_recognizer.task, ~8MB) into the same folder
@@ -31,11 +31,11 @@ model has no category for: Pointing, OK Sign, Rock On.
 You can extend `classify_gesture()` with your own logic/gestures.
 
 --------------------------------------------------------------------------
-ESP32 serial protocol
+ESP32 WiFi protocol (UDP)
 --------------------------------------------------------------------------
-Detected gestures are sent to the ESP32 over USB serial as newline-
-terminated, UTF-8 strings (e.g. b"thumbs_up\n"). Keep this label set in
-sync with whatever the Arduino sketch switches on:
+Detected gestures are sent to the ESP32 over WiFi as newline-terminated,
+UTF-8 UDP datagrams (e.g. b"thumbs_up\n") to ESP32_HOST:ESP32_PORT. Keep
+this label set in sync with whatever the ESP32 firmware switches on:
 
     thumbs_up
     thumbs_down
@@ -47,8 +47,15 @@ sync with whatever the Arduino sketch switches on:
 Any gesture classified by `classify_gesture()` that isn't one of the
 above (e.g. "Pointing", "OK Sign", "Rock On", "Unknown") is reported to
 the ESP32 as "none". A gesture must hold steady for GESTURE_STABLE_FRAMES
-consecutive frames before it is sent, to avoid chattering the serial line
-on single-frame misclassifications.
+consecutive frames before it is sent, to avoid chattering the link on
+single-frame misclassifications.
+
+This script also binds LOCAL_UDP_PORT to receive debug/status datagrams
+back from the ESP32 (printed with an "[ESP32]" prefix). The ESP32 can
+reply to whatever address/port a gesture datagram arrived from (the
+standard UDP request/reply pattern), or push a datagram to
+LOCAL_UDP_PORT unsolicited at any time, e.g. a boot/WiFi-connected
+message before this script has sent any gesture yet.
 --------------------------------------------------------------------------
 """
 
@@ -56,11 +63,11 @@ import os
 import math
 import time
 import atexit
+import socket
 import urllib.request
 
 import cv2
 import mediapipe as mp
-import serial
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision
 
@@ -70,10 +77,12 @@ MODEL_URL = (
     "gesture_recognizer/float16/1/gesture_recognizer.task"
 )
 
-# Serial connection to the ESP32. On Windows this looks like "COM3"; on
-# Mac/Linux it looks like "/dev/tty.usbserial-XXXX" or "/dev/ttyUSB0".
-SERIAL_PORT = "COM4"
-BAUD_RATE = 115200
+# WiFi UDP connection to the ESP32. Fill in your ESP32's IP (a static IP or
+# DHCP reservation on your router is strongly recommended -- if it moves,
+# gestures silently go nowhere).
+ESP32_HOST = "172.20.10.2"   # <-- set to your ESP32's IP
+ESP32_PORT = 4210              # port the ESP32 listens on for gesture commands
+LOCAL_UDP_PORT = 4211          # port this script listens on for ESP32 debug messages
 
 # --- Tuning knobs -------------------------------------------------------
 # Minimum confidence from the pretrained recognizer before a gesture counts.
@@ -98,9 +107,14 @@ CAPTURE_HEIGHT = 480
 # inference pass for no effect unless you want the on-screen overlay for
 # a second hand too.
 NUM_HANDS = 1
-# Ceiling on ESP32 lines drained per read_esp32_output() call, so a chatty
-# or malfunctioning ESP32 can't stall the frame loop indefinitely.
-MAX_SERIAL_LINES_PER_READ = 20
+# Ceiling on ESP32 messages drained per read_esp32_output() call, so a
+# chatty or malfunctioning ESP32 can't stall the frame loop indefinitely.
+MAX_ESP32_MESSAGES_PER_READ = 20
+# How long without hearing anything from the ESP32 (it heartbeats every
+# HEARTBEAT_INTERVAL=5s in gesture-esp.ino) before treating it as
+# unreachable. A bit over 2x that, to tolerate a couple of dropped
+# heartbeats before flagging it.
+ESP32_TIMEOUT_S = 12.0
 
 # Canned categories from MediaPipe's pretrained gesture recognizer. The
 # unmapped ones ("None", "Pointing_Up", "ILoveYou") fall through to the
@@ -124,61 +138,89 @@ GESTURE_LABELS = {
     "Fist": "fist",
 }
 
-ser = None
+sock = None
+last_esp32_contact = None  # time.monotonic() of the last datagram received from the ESP32
 
 
-def open_serial():
-    """Open the serial connection to the ESP32, if possible.
+def open_esp32_link():
+    """Open the UDP socket used to talk to the ESP32, if possible.
 
-    Failing to connect is non-fatal: gesture detection should keep working
-    even when the ESP32 isn't plugged in.
+    Failing to bind is non-fatal: gesture detection should keep working even
+    when the ESP32 isn't reachable. UDP has no handshake, so unlike the old
+    serial connection this always "succeeds" unless the local port is
+    already in use.
     """
-    global ser
+    global sock
     try:
-        ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
-        time.sleep(2)  # give the ESP32 time to reset and establish the connection
-        print(f"Connected to ESP32 on {SERIAL_PORT}")
-    except serial.SerialException as e:
-        print(f"Warning: could not open serial port {SERIAL_PORT}: {e}")
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.bind(("", LOCAL_UDP_PORT))
+        sock.setblocking(False)
+        print(f"Listening for ESP32 on UDP port {LOCAL_UDP_PORT}, "
+              f"sending gestures to {ESP32_HOST}:{ESP32_PORT}")
+    except OSError as e:
+        print(f"Warning: could not open UDP socket on port {LOCAL_UDP_PORT}: {e}")
         print("Continuing without ESP32 connection.")
-        ser = None
+        sock = None
 
 
-def close_serial():
-    """Close the serial connection, if it's open."""
-    if ser is not None and ser.is_open:
-        ser.close()
-        print("Serial connection closed.")
+def close_esp32_link():
+    """Close the UDP socket, if it's open."""
+    if sock is not None:
+        sock.close()
+        print("ESP32 connection closed.")
 
 
 def send_gesture(gesture_name: str):
-    """Send a gesture label to the ESP32 as a newline-terminated UTF-8 string."""
-    if ser is None:
+    """Send a gesture label to the ESP32 as a newline-terminated UTF-8 UDP datagram."""
+    if sock is None:
         return
     try:
-        ser.write(f"{gesture_name}\n".encode("utf-8"))
-        print(f"Sent gesture '{gesture_name}' to ESP32 on {SERIAL_PORT}")
-    except (serial.SerialException, OSError) as e:
-        print(f"Warning: failed to send gesture over serial: {e}")
+        sock.sendto(f"{gesture_name}\n".encode("utf-8"), (ESP32_HOST, ESP32_PORT))
+        print(f"Sent gesture '{gesture_name}' to ESP32 at {ESP32_HOST}:{ESP32_PORT}")
+    except OSError as e:
+        print(f"Warning: failed to send gesture over UDP: {e}")
 
 
 def read_esp32_output():
-    """Print any buffered debug/status lines the ESP32 has sent back.
+    """Print any buffered debug/status datagrams the ESP32 has sent back.
 
-    Non-blocking: only reads while ser.in_waiting reports bytes already
-    sitting in the buffer, so this never stalls the detection loop.
+    Non-blocking: a socket with setblocking(False) raises BlockingIOError
+    immediately when no datagram is waiting, so this never stalls the
+    detection loop.
     """
-    if ser is None:
+    global last_esp32_contact
+    if sock is None:
         return
-    try:
-        for _ in range(MAX_SERIAL_LINES_PER_READ):
-            if ser.in_waiting <= 0:
-                break
-            line = ser.readline().decode("utf-8", errors="ignore").strip()
-            if line:
-                print(f"[ESP32] {line}")
-    except (serial.SerialException, OSError) as e:
-        print(f"Warning: failed to read from serial: {e}")
+    for _ in range(MAX_ESP32_MESSAGES_PER_READ):
+        try:
+            data, _addr = sock.recvfrom(1024)
+        except BlockingIOError:
+            break
+        except ConnectionResetError:
+            # Windows-only quirk: sending a UDP datagram to a port with no
+            # listener can make a *later* recv on this socket raise
+            # WinError 10054, even though UDP has no real "connection" to
+            # reset. It just means nothing was there to read -- same as
+            # BlockingIOError for our purposes.
+            break
+        except OSError as e:
+            print(f"Warning: failed to read from ESP32: {e}")
+            break
+        last_esp32_contact = time.monotonic()  # any datagram at all counts as "still alive"
+        line = data.decode("utf-8", errors="ignore").strip()
+        if line:
+            print(f"[ESP32] {line}")
+
+
+def esp32_seems_connected():
+    """Whether the ESP32 has said anything within ESP32_TIMEOUT_S.
+
+    Returns None if we've never heard from it at all, which is distinct
+    from having heard from it before and then gone quiet.
+    """
+    if last_esp32_contact is None:
+        return None
+    return (time.monotonic() - last_esp32_contact) < ESP32_TIMEOUT_S
 
 # Landmark indices for fingertips and their corresponding lower joints
 FINGER_TIPS = [4, 8, 12, 16, 20]        # thumb, index, middle, ring, pinky
@@ -310,7 +352,7 @@ class GestureDebouncer:
     """Require the same label on N consecutive frames before it counts.
 
     Filters single-frame misclassifications and brief tracking dropouts so
-    they don't chatter the ESP32 serial line.
+    they don't chatter the ESP32 WiFi link.
     """
 
     def __init__(self, stable_frames):
@@ -353,8 +395,8 @@ def draw_landmarks(frame, landmarks, w, h):
 
 def main():
     ensure_model()
-    open_serial()
-    atexit.register(close_serial)
+    open_esp32_link()
+    atexit.register(close_esp32_link)
 
     base_options = mp_python.BaseOptions(model_asset_path=MODEL_PATH)
     options = vision.GestureRecognizerOptions(
@@ -378,6 +420,7 @@ def main():
     start_time = time.perf_counter()
     last_timestamp_ms = 0
     last_sent_gesture = None
+    esp32_was_connected = False  # tracks the previous frame's state, to log the transition once
     debouncer = GestureDebouncer(GESTURE_STABLE_FRAMES)
 
     try:
@@ -438,13 +481,26 @@ def main():
 
             read_esp32_output()
 
+            esp32_connected = esp32_seems_connected()
+            if esp32_connected is False and esp32_was_connected:
+                print(f"Warning: ESP32 has not responded in over {ESP32_TIMEOUT_S:.0f}s "
+                      f"-- check its WiFi connection and power.")
+            esp32_was_connected = bool(esp32_connected)
+
+            if esp32_connected is None:
+                status_text, status_color = "ESP32: waiting for first contact...", (0, 200, 255)
+            elif esp32_connected:
+                status_text, status_color = f"ESP32: {last_sent_gesture or '...'}", (0, 200, 255)
+            else:
+                status_text, status_color = "ESP32: UNREACHABLE", (0, 0, 255)  # BGR red
+
             cv2.putText(
                 frame,
-                f"ESP32: {last_sent_gesture or '...'}",
+                status_text,
                 (10, 30),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.8,
-                (0, 200, 255),
+                status_color,
                 2,
                 cv2.LINE_AA,
             )
@@ -459,7 +515,7 @@ def main():
         cap.release()
         cv2.destroyAllWindows()
         read_esp32_output()  # flush any remaining buffered ESP32 messages
-        close_serial()
+        close_esp32_link()
 
 
 if __name__ == "__main__":
