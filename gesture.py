@@ -89,6 +89,18 @@ OK_SIGN_RATIO = 0.35
 # Minimum thumb offset from the wrist, as a fraction of hand size, before
 # committing to Thumbs Up vs Thumbs Down.
 THUMB_DIRECTION_MARGIN = 0.3
+# Camera capture size. MediaPipe downsamples internally regardless, so a
+# higher capture resolution just costs more per-frame CPU for nothing.
+CAPTURE_WIDTH = 640
+CAPTURE_HEIGHT = 480
+# Hands to track per frame. Only one hand ever drives ESP32 output
+# (pick_driving_hand), so tracking a second hand costs a full extra
+# inference pass for no effect unless you want the on-screen overlay for
+# a second hand too.
+NUM_HANDS = 1
+# Ceiling on ESP32 lines drained per read_esp32_output() call, so a chatty
+# or malfunctioning ESP32 can't stall the frame loop indefinitely.
+MAX_SERIAL_LINES_PER_READ = 20
 
 # Canned categories from MediaPipe's pretrained gesture recognizer. The
 # unmapped ones ("None", "Pointing_Up", "ILoveYou") fall through to the
@@ -159,7 +171,9 @@ def read_esp32_output():
     if ser is None:
         return
     try:
-        while ser.in_waiting > 0:
+        for _ in range(MAX_SERIAL_LINES_PER_READ):
+            if ser.in_waiting <= 0:
+                break
             line = ser.readline().decode("utf-8", errors="ignore").strip()
             if line:
                 print(f"[ESP32] {line}")
@@ -172,23 +186,42 @@ FINGER_PIPS = [3, 6, 10, 14, 18]        # joint just below each tip
 
 
 def ensure_model():
-    """Download the gesture recognizer model file if it isn't already present."""
-    if not os.path.exists(MODEL_PATH):
-        print("Downloading hand gesture recognizer model (one-time, ~8MB)...")
-        urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
+    """Download the gesture recognizer model file if it isn't already present.
+
+    Downloads to a temp file and renames on success, so an interrupted
+    download (Ctrl+C, dropped connection) can't leave a truncated .task file
+    behind that silently poisons every later run.
+    """
+    if os.path.exists(MODEL_PATH):
+        return
+    print("Downloading hand gesture recognizer model (one-time, ~8MB)...")
+    partial_path = MODEL_PATH + ".part"
+    try:
+        urllib.request.urlretrieve(MODEL_URL, partial_path)
+        os.replace(partial_path, MODEL_PATH)
         print("Model downloaded to", MODEL_PATH)
+    except BaseException:
+        if os.path.exists(partial_path):
+            os.remove(partial_path)
+        raise
 
 
-def distance(a, b):
-    return math.hypot(a.x - b.x, a.y - b.y)
+def distance(a, b, aspect=1.0):
+    """Euclidean distance between two landmarks.
+
+    Normalized landmark x/y are scaled by frame width/height independently,
+    so x must be converted into y-units (aspect = width / height) before the
+    distances are comparable in any orientation.
+    """
+    return math.hypot((a.x - b.x) * aspect, a.y - b.y)
 
 
-def hand_scale(landmarks):
+def hand_scale(landmarks, aspect=1.0):
     """Reference length (wrist -> middle-finger MCP) for normalizing distances."""
-    return max(distance(landmarks[0], landmarks[9]), 1e-6)
+    return max(distance(landmarks[0], landmarks[9], aspect), 1e-6)
 
 
-def fingers_up(landmarks):
+def fingers_up(landmarks, aspect=1.0):
     """Return a list of booleans [thumb, index, middle, ring, pinky]
     indicating whether each finger is extended.
 
@@ -200,25 +233,28 @@ def fingers_up(landmarks):
     # Thumb: a folded thumb curls in toward the pinky side of the palm, so
     # compare distance to the pinky MCP rather than the wrist.
     palm_ref = landmarks[17]
-    fingers.append(distance(landmarks[4], palm_ref) > distance(landmarks[3], palm_ref))
+    fingers.append(distance(landmarks[4], palm_ref, aspect) > distance(landmarks[3], palm_ref, aspect))
 
     # Other four fingers: extended when the tip is farther from the wrist
     # than its pip joint is.
     wrist = landmarks[0]
     for tip, pip in zip(FINGER_TIPS[1:], FINGER_PIPS[1:]):
-        fingers.append(distance(landmarks[tip], wrist) > distance(landmarks[pip], wrist))
+        fingers.append(distance(landmarks[tip], wrist, aspect) > distance(landmarks[pip], wrist, aspect))
 
     return fingers
 
 
-def classify_gesture(landmarks):
-    f = fingers_up(landmarks)
+def classify_gesture(landmarks, aspect=1.0):
+    f = fingers_up(landmarks, aspect)
     thumb, index, middle, ring, pinky = f
     count_extended = sum(f)
-    scale = hand_scale(landmarks)
+    scale = hand_scale(landmarks, aspect)
 
-    # OK sign: thumb tip and index tip close together, other fingers extended
-    if distance(landmarks[4], landmarks[8]) / scale < OK_SIGN_RATIO and middle and ring and pinky:
+    # OK sign: thumb tip and index tip close together, index curled (an
+    # extended index is what actually distinguishes an open palm), and the
+    # other three fingers extended.
+    if (distance(landmarks[4], landmarks[8], aspect) / scale < OK_SIGN_RATIO
+            and not index and middle and ring and pinky):
         return "OK Sign"
 
     if count_extended == 0:
@@ -245,7 +281,7 @@ def classify_gesture(landmarks):
     return "Unknown"
 
 
-def resolve_gesture(gestures, landmarks):
+def resolve_gesture(gestures, landmarks, aspect=1.0):
     """Return (esp32_label, display_text) for one hand.
 
     Prefers the pretrained recognizer when it is confident; otherwise falls
@@ -257,7 +293,7 @@ def resolve_gesture(gestures, landmarks):
         if top.category_name in MP_GESTURE_LABELS and top.score >= MIN_GESTURE_CONFIDENCE:
             return MP_GESTURE_LABELS[top.category_name], f"{top.category_name} {top.score:.2f}"
 
-    gesture = classify_gesture(landmarks)
+    gesture = classify_gesture(landmarks, aspect)
     return GESTURE_LABELS.get(gesture, "none"), gesture
 
 
@@ -306,8 +342,7 @@ HAND_CONNECTIONS = [
 ]
 
 
-def draw_landmarks(frame, landmarks):
-    h, w, _ = frame.shape
+def draw_landmarks(frame, landmarks, w, h):
     points = [(int(lm.x * w), int(lm.y * h)) for lm in landmarks]
 
     for a, b in HAND_CONNECTIONS:
@@ -325,13 +360,17 @@ def main():
     options = vision.GestureRecognizerOptions(
         base_options=base_options,
         running_mode=vision.RunningMode.VIDEO,
-        num_hands=2,
+        num_hands=NUM_HANDS,
         min_hand_detection_confidence=MIN_HAND_DETECTION_CONFIDENCE,
         min_tracking_confidence=MIN_TRACKING_CONFIDENCE,
     )
     recognizer = vision.GestureRecognizer.create_from_options(options)
 
-    cap = cv2.VideoCapture(0)
+    # CAP_DSHOW avoids a multi-second startup stall the default MSMF backend
+    # is prone to on Windows.
+    cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAPTURE_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAPTURE_HEIGHT)
     if not cap.isOpened():
         print("Error: could not open webcam.")
         return
@@ -352,6 +391,9 @@ def main():
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
 
+            h, w, _ = frame.shape
+            aspect = w / h
+
             # Real elapsed time, forced strictly increasing (the VIDEO-mode
             # tracker requires monotonically increasing timestamps).
             timestamp_ms = max(int((time.perf_counter() - start_time) * 1000), last_timestamp_ms + 1)
@@ -361,31 +403,33 @@ def main():
             esp32_gesture = "none"
             driving_hand = pick_driving_hand(result)
 
-            if result.hand_landmarks:
-                for i, (landmarks, handedness) in enumerate(zip(result.hand_landmarks, result.handedness)):
-                    label = handedness[0].category_name  # "Left" / "Right"
-                    gestures = result.gestures[i] if i < len(result.gestures) else []
-                    esp32_label, display_text = resolve_gesture(gestures, landmarks)
+            for i, landmarks in enumerate(result.hand_landmarks):
+                # The frame is mirrored above before inference, so MediaPipe
+                # sees a mirrored world and its handedness call is reversed
+                # relative to the physical hand.
+                mp_label = result.handedness[i][0].category_name if i < len(result.handedness) else None
+                label = {"Left": "Right", "Right": "Left"}.get(mp_label, "?")
+                gestures = result.gestures[i] if i < len(result.gestures) else []
+                esp32_label, display_text = resolve_gesture(gestures, landmarks, aspect)
 
-                    if i == driving_hand:
-                        esp32_gesture = esp32_label
+                if i == driving_hand:
+                    esp32_gesture = esp32_label
 
-                    draw_landmarks(frame, landmarks)
+                draw_landmarks(frame, landmarks, w, h)
 
-                    h, w, _ = frame.shape
-                    wrist = landmarks[0]
-                    x, y = int(wrist.x * w), int(wrist.y * h)
-                    marker = "-> " if i == driving_hand else ""
-                    cv2.putText(
-                        frame,
-                        f"{marker}{label}: {display_text}",
-                        (x - 40, y + 40),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.8,
-                        (0, 255, 0),
-                        2,
-                        cv2.LINE_AA,
-                    )
+                wrist = landmarks[0]
+                x, y = int(wrist.x * w), int(wrist.y * h)
+                marker = "-> " if i == driving_hand else ""
+                cv2.putText(
+                    frame,
+                    f"{marker}{label}: {display_text}",
+                    (x - 40, y + 40),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8,
+                    (0, 255, 0),
+                    2,
+                    cv2.LINE_AA,
+                )
 
             confirmed = debouncer.update(esp32_gesture)
             if confirmed is not None and confirmed != last_sent_gesture:
