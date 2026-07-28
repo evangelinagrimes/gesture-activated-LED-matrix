@@ -32,7 +32,7 @@
 const char* WIFI_SSID = "GL-AR300M-1ab";
 const char* WIFI_PASSWORD = "goodlife";
 
-// Must match ESP32_PORT / LOCAL_UDP_PORT in gesture.py.
+// Must match ESP32_PORT / LOCAL_UDP_PORT in led_matrix_controller.py.
 const unsigned int LISTEN_PORT = 4210;  // gesture commands arrive here
 const unsigned int REPLY_PORT = 4211;   // debug/status messages go here
 
@@ -63,9 +63,9 @@ bool wifiWasConnected = true;
 IPAddress lastSenderIP;
 bool haveSender = false;
 
-// Prints locally over USB (always) and, once we know where gesture.py is
-// listening, also sends the same message back to it over UDP so it shows
-// up in the [ESP32]-prefixed terminal log.
+// Prints locally over USB (always) and, once we know where
+// led_matrix_controller.py is listening, also sends the same message back
+// to it over UDP so it shows up in the [ESP32]-prefixed terminal log.
 void sendStatus(const String& message) {
   Serial.println(message);
   if (!haveSender) return;
@@ -88,8 +88,9 @@ IPAddress broadcastAddress() {
   return bcast;
 }
 
-// Like sendStatus(), but also broadcasts on the local subnet. gesture.py's
-// UDP listener accepts a datagram from any address, so this reaches it even
+// Like sendStatus(), but also broadcasts on the local subnet.
+// led_matrix_controller.py's UDP listener accepts a datagram from any
+// address, so this reaches it even
 // if haveSender is still false (no gesture has ever been sent this boot) --
 // used only for the handful of messages that matter for the connection log
 // (boot diagnostics, reconnect summaries) even on a session with no gestures.
@@ -139,6 +140,22 @@ void processGesture(String gesture) {
 
   gestureCount++;
   lastGestureReceived = millis();
+}
+
+// Renders a raw single-byte-per-pixel grayscale frame (NUMPIXELS bytes,
+// row-major) pushed from the PC -- see send_image() in
+// led_matrix_controller.py. Each byte becomes an equal R=G=B pixel value;
+// no gamma correction, so what you send is what you get (matching typical
+// image2cpp-style byte dumps, which are usually already display-intended
+// brightness rather than raw gamma-linear pixel data).
+void displayImage(const uint8_t* gray) {
+  for (int i = 0; i < NUMPIXELS; i++) {
+    uint8_t v = gray[i];
+    pixels.setPixelColor(i, pixels.Color(v, v, v));
+  }
+  pixels.show();
+  sendStatus("Displayed image frame (" + String(NUMPIXELS) + " px)");
+  lastGestureReceived = millis();  // counts as activity for the heartbeat's "last seen" field
 }
 
 void printHeartbeat() {
@@ -250,10 +267,10 @@ void connectWiFi() {
   Serial.println();
   Serial.print("Connected. IP address: ");
   Serial.println(WiFi.localIP());
-  Serial.print("Set ESP32_HOST in gesture.py to: ");
+  Serial.print("Set ESP32_HOST in led_matrix_controller.py to: ");
   Serial.println(WiFi.localIP());
 
-  // Broadcast (not just unicast) so gesture.py's connection log picks this
+  // Broadcast (not just unicast) so led_matrix_controller.py's connection log picks this
   // up even if it hasn't sent a gesture yet this session -- this is the
   // one place the boot-time reset reason (brownout vs normal) ever leaves
   // the board.
@@ -283,7 +300,7 @@ void maintainWiFi() {
       udp.begin(LISTEN_PORT);  // rebind -- the network interface reset under us
       wifiWasConnected = true;
       // broadcastStatus, not sendStatus: this is the main thing the
-      // connection log needs, so it must reach gesture.py even if no
+      // connection log needs, so it must reach led_matrix_controller.py even if no
       // gesture has ever been sent (haveSender still false).
       broadcastStatus("WiFi reconnected after " + String(reconnectAttempts) +
                        " attempt(s), down for " + String(downtimeS) + "s. Last disconnect " +
@@ -353,9 +370,19 @@ void loop() {
     lastSenderIP = udp.remoteIP();
     haveSender = true;
 
-    int len = udp.read(packetBuffer, sizeof(packetBuffer) - 1);
-    packetBuffer[len > 0 ? len : 0] = '\0';
-    processGesture(String(packetBuffer));
+    if (packetSize == NUMPIXELS) {
+      // A raw NUMPIXELS-byte datagram is a full-frame grayscale image, not
+      // a gesture label -- see send_image() in led_matrix_controller.py.
+      // Distinguishing by exact size (rather than a text prefix) keeps
+      // gesture commands as plain, easy-to-read ASCII.
+      uint8_t imageBuffer[NUMPIXELS];
+      udp.read(imageBuffer, NUMPIXELS);
+      displayImage(imageBuffer);
+    } else {
+      int len = udp.read(packetBuffer, sizeof(packetBuffer) - 1);
+      packetBuffer[len > 0 ? len : 0] = '\0';
+      processGesture(String(packetBuffer));
+    }
   }
 
   if (millis() - lastHeartbeat >= HEARTBEAT_INTERVAL) {

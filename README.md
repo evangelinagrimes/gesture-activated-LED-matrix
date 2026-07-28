@@ -1,19 +1,26 @@
-# Gesture-Activated LED Matrix
+# LED Matrix Controller
 
-Wave at a webcam, light up a 256-LED matrix. A Python script watches your
-hand through a camera, classifies the gesture you're making, and sends it
-over WiFi to an ESP32, which lights a NeoPixel matrix a different color per
-gesture.
+Drive a 256-LED NeoPixel matrix from a PC over WiFi, two ways: wave at a
+webcam and light it up a color per hand gesture, or push a static image
+(from a hex byte dump) to display as a full-frame grayscale picture.
 
 ## How it works
 
 ```
- webcam --> gesture.py (MediaPipe + OpenCV) --> UDP --> ESP32 --> NeoPixel matrix
+ webcam --> led_matrix_controller.py (MediaPipe + OpenCV) --> UDP --> ESP32 --> NeoPixel matrix
+             (or: hex image file  ------------------------->)
                                                   <-- UDP status/heartbeat --
 ```
 
-**`gesture.py`** (runs on your PC) captures webcam frames with OpenCV and
-classifies the hand in frame using a hybrid approach:
+**`led_matrix_controller.py`** (runs on your PC) does two things:
+
+- Captures webcam frames with OpenCV and classifies the hand in frame
+  using a hybrid approach (see below), sending a short gesture label to
+  the ESP32 over UDP.
+- On demand (press `i`), reads a hex-literal image file and pushes it as a
+  raw 256-byte grayscale frame to the ESP32 over the same UDP link.
+
+### Gesture detection
 
 1. MediaPipe's pretrained `GestureRecognizer` (Tasks API) handles Thumbs Up,
    Thumbs Down, Peace Sign, Open Palm, and Fist, each gated by a confidence
@@ -31,7 +38,7 @@ newline-terminated UDP datagrams (e.g. `thumbs_up\n`) to the ESP32.
 **`gesture-esp/gesture-esp.ino`** (runs on the ESP32) listens for those
 datagrams and sets the whole NeoPixel matrix to a solid color per gesture.
 It also sends status/heartbeat messages back to the PC over UDP, which
-`gesture.py` prints with an `[ESP32]` prefix and uses to track whether the
+`led_matrix_controller.py` prints with an `[ESP32]` prefix and uses to track whether the
 board is still reachable.
 
 ### Gesture → color mapping
@@ -48,11 +55,26 @@ board is still reachable.
 Gestures the ESP32 doesn't recognize (`Pointing`, `OK Sign`, `Rock On`,
 `Unknown`) are sent as `none`.
 
+### Image display
+
+Point `IMAGE_PATH` (top of `led_matrix_controller.py`) at a hex-literal
+byte dump — either a C header like image2cpp's
+`const uint8_t image[] PROGMEM = {0xFF, 0xBF, ...};` or a plain
+comma-separated `.txt` — containing exactly `NUMPIXELS` (256) bytes: one
+grayscale brightness value per LED, row-major. `load_image_bytes()` just
+scans the file for `0xNN` tokens, so it doesn't care which of the two
+formats you use.
+
+Press `i` while the script is running to push it to the matrix as one raw
+UDP datagram. The ESP32 (`displayImage()` in `gesture-esp.ino`) tells this
+apart from a gesture command purely by packet size — a 256-byte datagram
+is always an image frame, never a gesture label.
+
 ## Hardware
 
 - ESP32 DevKit V1 (or similar)
 - WS2812/NeoPixel matrix, 256 pixels, data line on GPIO 5 (`LED_PIN`)
-- A webcam on the PC running `gesture.py`
+- A webcam on the PC running `led_matrix_controller.py`
 - A stable 5V supply for the ESP32 + LED matrix — a weak USB cable/port is a
   common cause of drops under WiFi TX load; the firmware logs a `BROWNOUT`
   reset reason at boot if this is happening (see below)
@@ -75,18 +97,19 @@ Gestures the ESP32 doesn't recognize (`Pointing`, `OK Sign`, `Rock On`,
 pip install -r requirements.txt
 ```
 
-1. Set `ESP32_HOST` in `gesture.py` to the IP address from the Serial
+1. Set `ESP32_HOST` in `led_matrix_controller.py` to the IP address from the Serial
    Monitor (a static IP or DHCP reservation is strongly recommended — if
    the ESP32's address changes, gestures silently go nowhere).
 2. Run it:
 
    ```
-   python gesture.py
+   python led_matrix_controller.py
    ```
 
    On first run this downloads MediaPipe's pretrained gesture recognizer
    model (`gesture_recognizer.task`, ~8MB) into the project folder.
-3. Press `q` in the video window to quit.
+3. In the video window: `q` quits, `i` pushes the image at `IMAGE_PATH`
+   to the matrix.
 
 ## Connection monitoring & diagnostics
 
@@ -101,7 +124,7 @@ both sides have diagnostics beyond a simple connected/disconnected flag:
   logs the specific WiFi disconnect reason (`wifi_err_reason_t`, e.g.
   `BEACON_TIMEOUT` vs `AUTH_FAIL`) via `WiFi.onEvent()`, and reports the
   reset reason at boot (`BROWNOUT` is the tell for a power supply problem).
-- **`gesture.py`**: the on-screen overlay shows elapsed downtime and an
+- **`led_matrix_controller.py`**: the on-screen overlay shows elapsed downtime and an
   estimated reconnect-attempt count while `UNREACHABLE`, then the ESP32's
   real attempt count once it recovers. Every connection-relevant event
   (drops, recoveries, disconnect reasons) is also appended to
@@ -123,7 +146,7 @@ required.
 
 ## Tuning knobs
 
-The constants at the top of `gesture.py` control most of the tunable
+The constants at the top of `led_matrix_controller.py` control most of the tunable
 behavior: gesture confidence thresholds, hand-detection/tracking
 confidence, debounce frame count, and the ESP32 unreachable-timeout. See
 the comments next to each for what turning it up or down does.

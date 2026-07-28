@@ -1,5 +1,5 @@
 """
-Unit tests for the pure classification functions in gesture.py.
+Unit tests for the pure classification functions in led_matrix_controller.py.
 
 No camera or serial hardware required — these build synthetic 21-point
 hand landmark sets by hand and feed them straight into classify_gesture()
@@ -11,7 +11,7 @@ and friends. Run with:
 import math
 import unittest
 
-import gesture
+import led_matrix_controller as gesture
 
 
 class LM:

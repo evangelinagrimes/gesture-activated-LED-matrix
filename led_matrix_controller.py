@@ -1,13 +1,17 @@
 """
-Real-Time Hand Gesture Detection
-==================================
-Uses MediaPipe's new Tasks API (GestureRecognizer) + OpenCV to detect hand
-gestures live from your webcam.
+LED Matrix Controller
+======================
+Drives a NeoPixel LED matrix over WiFi/UDP from a PC in two ways:
 
-NOTE: This uses mediapipe.tasks (the current, actively-maintained API),
-NOT the old mp.solutions.hands API, which is deprecated and broken on
-many recent pip installs (see: github.com/google-ai-edge/mediapipe issues
-#6200, #6204, #6261). This version avoids that problem entirely.
+1. Real-time hand gesture detection (MediaPipe Tasks GestureRecognizer +
+   OpenCV) -- wave at the webcam, the matrix lights up a color per gesture.
+2. Pushing a static image, read from a hex-literal byte dump (.h or .txt),
+   to be displayed as a full-frame grayscale picture on the matrix.
+
+NOTE: Gesture detection uses mediapipe.tasks (the current,
+actively-maintained API), NOT the old mp.solutions.hands API, which is
+deprecated and broken on many recent pip installs (see:
+github.com/google-ai-edge/mediapipe issues #6200, #6204, #6261).
 
 Install dependencies:
     pip install mediapipe opencv-python
@@ -17,9 +21,9 @@ recognizer model file (gesture_recognizer.task, ~8MB) into the same folder
 as this script.
 
 Run:
-    python3 gesture_detection.py
+    python3 led_matrix_controller.py
 
-Press 'q' to quit.
+Press 'q' to quit, 'i' to push the image at IMAGE_PATH to the matrix.
 
 Gesture classification is a hybrid: MediaPipe's pretrained recognizer
 handles Thumbs Up, Thumbs Down, Peace Sign, Open Palm, and Fist (each with
@@ -33,9 +37,12 @@ You can extend `classify_gesture()` with your own logic/gestures.
 --------------------------------------------------------------------------
 ESP32 WiFi protocol (UDP)
 --------------------------------------------------------------------------
-Detected gestures are sent to the ESP32 over WiFi as newline-terminated,
-UTF-8 UDP datagrams (e.g. b"thumbs_up\n") to ESP32_HOST:ESP32_PORT. Keep
-this label set in sync with whatever the ESP32 firmware switches on:
+Two datagram shapes go to ESP32_HOST:ESP32_PORT, told apart purely by size
+(see loop() in gesture-esp.ino):
+
+- A short newline-terminated UTF-8 label (e.g. b"thumbs_up\n") is a
+  gesture command. Keep this label set in sync with whatever the ESP32
+  firmware switches on:
 
     thumbs_up
     thumbs_down
@@ -44,11 +51,15 @@ this label set in sync with whatever the ESP32 firmware switches on:
     fist
     none
 
-Any gesture classified by `classify_gesture()` that isn't one of the
-above (e.g. "Pointing", "OK Sign", "Rock On", "Unknown") is reported to
-the ESP32 as "none". A gesture must hold steady for GESTURE_STABLE_FRAMES
-consecutive frames before it is sent, to avoid chattering the link on
-single-frame misclassifications.
+  Any gesture classified by `classify_gesture()` that isn't one of the
+  above (e.g. "Pointing", "OK Sign", "Rock On", "Unknown") is reported to
+  the ESP32 as "none". A gesture must hold steady for
+  GESTURE_STABLE_FRAMES consecutive frames before it is sent, to avoid
+  chattering the link on single-frame misclassifications.
+
+- A raw datagram of exactly NUMPIXELS bytes is a full-frame image: one
+  grayscale brightness byte per LED, row-major. See send_image() and
+  load_image_bytes().
 
 This script also binds LOCAL_UDP_PORT to receive debug/status datagrams
 back from the ESP32 (printed with an "[ESP32]" prefix). The ESP32 can
@@ -90,8 +101,18 @@ MODEL_URL = (
 # DHCP reservation on your router is strongly recommended -- if it moves,
 # gestures silently go nowhere).
 ESP32_HOST = "192.168.8.182"   # <-- set to your ESP32's IP
-ESP32_PORT = 4210              # port the ESP32 listens on for gesture commands
+ESP32_PORT = 4210              # port the ESP32 listens on for gesture commands / images
 LOCAL_UDP_PORT = 4211          # port this script listens on for ESP32 debug messages
+
+# Must match NUMPIXELS in gesture-esp.ino -- also doubles as the exact byte
+# count an image datagram must be, since that's how the ESP32 tells an
+# image frame apart from a gesture command (see displayImage() there).
+NUMPIXELS = 256
+# Path to the hex-literal image to push with the 'i' key. Point this at
+# your own .h or .txt -- load_image_bytes() just scans for `0xNN` tokens,
+# so either a `const uint8_t image[] PROGMEM = {0xFF, ...};` style .h file
+# or a plain comma-separated hex dump works.
+IMAGE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "images", "example.h")
 
 # --- Tuning knobs -------------------------------------------------------
 # Minimum confidence from the pretrained recognizer before a gesture counts.
@@ -283,6 +304,51 @@ def send_gesture(gesture_name: str):
         print(f"Sent gesture '{gesture_name}' to ESP32 at {ESP32_HOST}:{ESP32_PORT}")
     except OSError as e:
         print(f"Warning: failed to send gesture over UDP: {e}")
+
+
+# Matches a hex byte literal like 0xFF or 0x0a. Deliberately format-agnostic
+# about what's around it, so it works equally on a full C header (variable
+# declaration, PROGMEM attribute, braces, comments) or a bare comma/newline
+# separated hex dump -- it just pulls out every `0xNN` token in the file.
+HEX_TOKEN_RE = re.compile(r"0[xX][0-9A-Fa-f]{2}")
+
+
+def load_image_bytes(path: str) -> bytes:
+    """Extract a flat grayscale byte-per-pixel image from a hex-literal file.
+
+    Expects exactly NUMPIXELS bytes (one brightness value per LED, row-major)
+    -- raises ValueError with a count mismatch if the file doesn't match, so
+    a wrong/partial file fails loudly instead of drawing a corrupted image.
+    """
+    with open(path, "r") as f:
+        text = f.read()
+    values = [int(tok, 16) for tok in HEX_TOKEN_RE.findall(text)]
+    if len(values) != NUMPIXELS:
+        raise ValueError(
+            f"found {len(values)} hex byte(s), expected exactly {NUMPIXELS} "
+            f"(one grayscale byte per LED)"
+        )
+    return bytes(values)
+
+
+def send_image(path: str = IMAGE_PATH):
+    """Push a full-frame grayscale image to the ESP32 as a single raw UDP
+    datagram of NUMPIXELS bytes -- no text framing, since the ESP32 tells
+    this apart from a gesture command purely by packet size (see
+    displayImage() in gesture-esp.ino).
+    """
+    if sock is None:
+        return
+    try:
+        image_bytes = load_image_bytes(path)
+    except (OSError, ValueError) as e:
+        print(f"Warning: could not load image from {path}: {e}")
+        return
+    try:
+        sock.sendto(image_bytes, (ESP32_HOST, ESP32_PORT))
+        print(f"Sent image frame ({len(image_bytes)} px) from {path} to ESP32 at {ESP32_HOST}:{ESP32_PORT}")
+    except OSError as e:
+        print(f"Warning: failed to send image over UDP: {e}")
 
 
 def read_esp32_output():
@@ -640,9 +706,12 @@ def main():
                 cv2.LINE_AA,
             )
 
-            cv2.imshow("Gesture Detection (press 'q' to quit)", frame)
-            if cv2.waitKey(5) & 0xFF == ord("q"):
+            cv2.imshow("LED Matrix Controller (q: quit, i: send image)", frame)
+            key = cv2.waitKey(5) & 0xFF
+            if key == ord("q"):
                 break
+            elif key == ord("i"):
+                send_image(IMAGE_PATH)
     except KeyboardInterrupt:
         print("Interrupted, shutting down.")
     finally:
