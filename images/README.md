@@ -1,8 +1,8 @@
 # Images
 
-Drop your hex-literal image file(s) here and point `IMAGE_PATH` (top of
-`led_matrix_controller.py`) at the one you want the `i` key to push to the
-matrix.
+Drop your hex-literal image file(s) here, then either point `IMAGE_PATH`
+(top of `send_image.py`) at the one you want to send by default, or pass
+its path as a command-line argument: `python send_image.py images/foo.h`.
 
 `load_image_bytes()` accepts either:
 
