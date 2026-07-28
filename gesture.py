@@ -61,6 +61,7 @@ message before this script has sent any gesture yet.
 
 import os
 import math
+import re
 import time
 import atexit
 import socket
@@ -80,7 +81,7 @@ MODEL_URL = (
 # WiFi UDP connection to the ESP32. Fill in your ESP32's IP (a static IP or
 # DHCP reservation on your router is strongly recommended -- if it moves,
 # gestures silently go nowhere).
-ESP32_HOST = "172.20.10.2"   # <-- set to your ESP32's IP
+ESP32_HOST = "192.168.8.182"   # <-- set to your ESP32's IP
 ESP32_PORT = 4210              # port the ESP32 listens on for gesture commands
 LOCAL_UDP_PORT = 4211          # port this script listens on for ESP32 debug messages
 
@@ -115,6 +116,15 @@ MAX_ESP32_MESSAGES_PER_READ = 20
 # unreachable. A bit over 2x that, to tolerate a couple of dropped
 # heartbeats before flagging it.
 ESP32_TIMEOUT_S = 12.0
+# Must match WIFI_RECONNECT_INTERVAL in gesture-esp.ino. Used only to
+# estimate how many reconnect attempts the ESP32 has likely made while
+# unreachable -- there's no way to hear the real count until it reconnects,
+# since no network path exists while WiFi is down.
+ESP32_RECONNECT_INTERVAL_S = 5.0
+# How long to keep showing the ESP32's own reconnect report (attempts +
+# downtime, sent once right after it reconnects) before reverting to the
+# normal gesture status line.
+RECONNECT_NOTE_DISPLAY_S = 5.0
 
 # Canned categories from MediaPipe's pretrained gesture recognizer. The
 # unmapped ones ("None", "Pointing_Up", "ILoveYou") fall through to the
@@ -140,6 +150,12 @@ GESTURE_LABELS = {
 
 sock = None
 last_esp32_contact = None  # time.monotonic() of the last datagram received from the ESP32
+
+# Parses the ESP32's "WiFi reconnected after N attempt(s), down for Xs"
+# status line (see maintainWiFi() in gesture-esp.ino).
+RECONNECT_REPORT_RE = re.compile(r"^WiFi reconnected after (\d+) attempt")
+last_reconnect_report = None      # (attempts: int, message: str) from the ESP32's own count
+last_reconnect_report_time = None  # time.monotonic() it arrived
 
 
 def open_esp32_link():
@@ -188,7 +204,7 @@ def read_esp32_output():
     immediately when no datagram is waiting, so this never stalls the
     detection loop.
     """
-    global last_esp32_contact
+    global last_esp32_contact, last_reconnect_report, last_reconnect_report_time
     if sock is None:
         return
     for _ in range(MAX_ESP32_MESSAGES_PER_READ):
@@ -210,6 +226,10 @@ def read_esp32_output():
         line = data.decode("utf-8", errors="ignore").strip()
         if line:
             print(f"[ESP32] {line}")
+            match = RECONNECT_REPORT_RE.match(line)
+            if match:
+                last_reconnect_report = (int(match.group(1)), line)
+                last_reconnect_report_time = time.monotonic()
 
 
 def esp32_seems_connected():
@@ -491,8 +511,20 @@ def main():
                 status_text, status_color = "ESP32: waiting for first contact...", (0, 200, 255)
             elif esp32_connected:
                 status_text, status_color = f"ESP32: {last_sent_gesture or '...'}", (0, 200, 255)
+                # Briefly show the ESP32's own reconnect telemetry (real
+                # attempt count + downtime) right after it comes back.
+                if (last_reconnect_report_time is not None
+                        and time.monotonic() - last_reconnect_report_time < RECONNECT_NOTE_DISPLAY_S):
+                    attempts, _msg = last_reconnect_report
+                    status_text += f" (reconnected after {attempts} attempt(s))"
             else:
-                status_text, status_color = "ESP32: UNREACHABLE", (0, 0, 255)  # BGR red
+                downtime_s = time.monotonic() - last_esp32_contact
+                # No network path exists to ask the ESP32 for its real
+                # attempt count while it's down, so estimate from elapsed
+                # downtime and its known retry interval.
+                est_attempts = int(downtime_s // ESP32_RECONNECT_INTERVAL_S)
+                status_text = f"ESP32: UNREACHABLE ({downtime_s:.0f}s, ~{est_attempts} reconnect attempts)"
+                status_color = (0, 0, 255)  # BGR red
 
             cv2.putText(
                 frame,
