@@ -2,8 +2,9 @@
 Send Image to LED Matrix
 =========================
 Pushes a static image, read from a hex-literal byte dump, to an ESP32-driven
-NeoPixel LED matrix over WiFi/UDP. This project doesn't run continuously or
-need a persistent connection -- it's just "load an image, send it, done."
+NeoPixel LED matrix over a direct USB serial connection. This project
+doesn't run continuously or need a persistent connection -- it's just
+"load an image, send it, done."
 
 Run:
     python send_image.py [path/to/image.h]
@@ -27,34 +28,44 @@ Either way, this just scans for `0xNN` tokens, so it doesn't care whether
 the surrounding syntax is a `.h` C header or a plain comma-separated `.txt`.
 
 --------------------------------------------------------------------------
-ESP32 WiFi protocol (UDP)
+ESP32 serial protocol
 --------------------------------------------------------------------------
-The image is sent to ESP32_HOST:ESP32_PORT as a single raw UDP datagram of
-exactly NUMPIXELS bytes -- no text framing needed, since the ESP32
-(loop() in led_matrix_esp.ino) tells this apart from anything else purely
-by that exact size. The ESP32 sends a short ack back to REPLY_PORT once
-it's displayed the frame; this script waits briefly for it purely as a
-courtesy, since the two devices don't need to stay continuously connected
--- not hearing one back isn't treated as fatal, just a hint to check the
-ESP32 if the matrix didn't update.
+Serial is a raw byte stream with no packet boundaries (unlike UDP), so the
+frame needs its own framing: FRAME_MARKER + NUMPIXELS grayscale bytes
+(row-major) + 1 checksum byte (sum of the payload bytes, mod 256). The
+ESP32 (loop() in led_matrix_esp.ino) scans for FRAME_MARKER, reads the
+payload + checksum, and only renders it if the checksum matches -- this is
+what catches a corrupted or desynced frame instead of silently drawing
+garbage, now that there's no transport-level packet boundary to rely on.
+It prints a short OK/ERR line back over the same serial connection; this
+script waits briefly for it purely as a courtesy, since the two devices
+don't need to stay continuously connected -- not hearing one back isn't
+treated as fatal, just a hint to check the ESP32 if the matrix didn't
+update.
 --------------------------------------------------------------------------
 """
 
 import os
 import re
 import sys
-import socket
+import time
 
 import cv2
 import numpy as np
+import serial
+import serial.tools.list_ports
 
-# WiFi UDP connection to the ESP32. Fill in your ESP32's IP (a static IP or
-# DHCP reservation on your router is strongly recommended -- if it moves,
-# the image silently goes nowhere).
-ESP32_HOST = "192.168.8.182"   # <-- set to your ESP32's IP
-ESP32_PORT = 4210              # port the ESP32 listens on for image frames
-REPLY_PORT = 4211              # port this script listens on for the ESP32's ack
-ACK_TIMEOUT_S = 2.0            # how long to wait for the ack before giving up (non-fatal)
+# Direct USB serial connection to the ESP32. Find the port in Windows'
+# Device Manager under "Ports (COM & LPT)" once the board is plugged in
+# (shows as something like "Silicon Labs CP210x" or "USB-SERIAL CH340").
+# Only one program can hold the port open at a time -- close the Arduino
+# Serial Monitor before running this.
+SERIAL_PORT = "COM5"   # <-- set to your ESP32's COM port
+BAUD_RATE = 115200     # must match Serial.begin() in led_matrix_esp.ino
+SERIAL_TIMEOUT_S = 2.0        # how long to wait for the ESP32's ack (non-fatal)
+BOOT_SETTLE_S = 2.0           # opening the port can reset the board; give it time to finish setup()
+
+FRAME_MARKER = b"I"  # must match FRAME_MARKER in led_matrix_esp.ino
 
 # Physical dimensions of the LED matrix. Their product must match NUMPIXELS
 # in led_matrix_esp.ino -- that's also the exact byte count the image
@@ -175,29 +186,42 @@ def load_image_bytes(path: str) -> bytes:
     return resized.astype(np.uint8).tobytes()
 
 
+def _list_available_ports():
+    ports = list(serial.tools.list_ports.comports())
+    if not ports:
+        return "no serial ports were found at all -- is the ESP32 plugged in?"
+    return "available ports: " + ", ".join(f"{p.device} ({p.description})" for p in ports)
+
+
 def send_image(path: str = IMAGE_PATH):
-    """Load path and push it to the ESP32 as a single raw UDP datagram of
-    NUMPIXELS bytes. Waits briefly for the ESP32's ack as a courtesy --
-    not receiving one isn't fatal, since the link doesn't need to stay up.
+    """Load path and push it to the ESP32 as a single framed serial write:
+    FRAME_MARKER + NUMPIXELS grayscale bytes + 1 checksum byte. Waits
+    briefly for the ESP32's OK/ERR line as a courtesy -- not receiving one
+    isn't fatal, since the link doesn't need to stay up between pushes.
     """
     image_bytes = load_image_bytes(path)
+    checksum = sum(image_bytes) & 0xFF
+    frame = FRAME_MARKER + image_bytes + bytes([checksum])
 
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        sock.bind(("", REPLY_PORT))
-        sock.settimeout(ACK_TIMEOUT_S)
-        sock.sendto(image_bytes, (ESP32_HOST, ESP32_PORT))
-        print(f"Sent image frame ({len(image_bytes)} px) from {path} to ESP32 at {ESP32_HOST}:{ESP32_PORT}")
-        try:
-            data, _addr = sock.recvfrom(256)
-            print(f"[ESP32] {data.decode('utf-8', errors='ignore').strip()}")
-        except socket.timeout:
-            print(f"No response from ESP32 within {ACK_TIMEOUT_S:.0f}s -- "
-                  f"check its power/WiFi if the matrix didn't update.")
-    except OSError as e:
-        print(f"Warning: failed to send image over UDP: {e}")
-    finally:
-        sock.close()
+        with serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=SERIAL_TIMEOUT_S) as ser:
+            # Opening the port toggles DTR/RTS on most ESP32 boards' USB-serial
+            # chips, which resets the board -- give setup() time to finish
+            # before writing, or the first frame gets lost while it reboots.
+            time.sleep(BOOT_SETTLE_S)
+            ser.reset_input_buffer()
+            ser.write(frame)
+            print(f"Sent image frame ({len(image_bytes)} px) from {path} to {SERIAL_PORT}")
+
+            response = ser.readline()
+            if response:
+                print(f"[ESP32] {response.decode('utf-8', errors='ignore').strip()}")
+            else:
+                print(f"No response from ESP32 within {SERIAL_TIMEOUT_S:.0f}s -- "
+                      f"check its power/connection if the matrix didn't update.")
+    except serial.SerialException as e:
+        print(f"Warning: failed to send image over serial ({SERIAL_PORT}): {e}")
+        print(f"  {_list_available_ports()}")
 
 
 def main():

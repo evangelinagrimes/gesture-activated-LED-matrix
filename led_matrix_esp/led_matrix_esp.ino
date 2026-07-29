@@ -1,24 +1,16 @@
-#include <WiFi.h>
-#include <WiFiUdp.h>
 #include <Adafruit_NeoPixel.h>
 
 #define LED_PIN 5
 #define NUMPIXELS 256
-#define WIFI_RECONNECT_INTERVAL 5000  // how often to retry WiFi.reconnect() while down
+#define FRAME_MARKER 'I'       // sync byte marking the start of an image frame
+#define FRAME_TIMEOUT_MS 2000  // abort a partially-received frame after this long
 
-// WiFi credentials
-const char* WIFI_SSID = "GL-AR300M-1ab";
-const char* WIFI_PASSWORD = "goodlife";
-
-// Must match ESP32_PORT / REPLY_PORT in send_image.py.
-const unsigned int LISTEN_PORT = 4210;  // image frames arrive here
-const unsigned int REPLY_PORT = 4211;   // ack goes back here
-
+// Must match FRAME_MARKER / BAUD_RATE in send_image.py. Frame shape on the
+// wire: FRAME_MARKER + NUMPIXELS grayscale bytes (row-major) + 1 checksum
+// byte (sum of the payload bytes, mod 256).
 Adafruit_NeoPixel pixels(NUMPIXELS, LED_PIN, NEO_GRB + NEO_KHZ800);
-WiFiUDP udp;
 
 uint8_t imageBuffer[NUMPIXELS];
-unsigned long lastReconnectAttempt = 0;
 
 void setColor(uint8_t r, uint8_t g, uint8_t b) {
   for (int i = 0; i < NUMPIXELS; i++) {
@@ -38,65 +30,56 @@ void displayImage(const uint8_t* gray) {
   pixels.show();
 }
 
-void connectWiFi() {
-  Serial.print("Connecting to WiFi ");
-  Serial.print(WIFI_SSID);
-  WiFi.mode(WIFI_STA);
-  WiFi.setSleep(false);  // avoid missing the occasional incoming datagram to modem-sleep power-save
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
+// Called once FRAME_MARKER has already been consumed from the stream.
+// Blocks (with a timeout, so a dropped/short frame can't hang the board
+// forever) until NUMPIXELS payload bytes + 1 checksum byte have arrived,
+// then verifies the checksum. Serial has no packet boundaries the way UDP
+// did, so the checksum is what catches a corrupted or desynced frame
+// instead of silently drawing garbage.
+bool readFrame(uint8_t* out) {
+  size_t received = 0;
+  bool haveChecksum = false;
+  uint8_t checksum = 0;
+  unsigned long start = millis();
+
+  while (received < NUMPIXELS || !haveChecksum) {
+    if (millis() - start > FRAME_TIMEOUT_MS) return false;
+    if (!Serial.available()) continue;
+    uint8_t b = Serial.read();
+    if (received < NUMPIXELS) {
+      out[received++] = b;
+    } else {
+      checksum = b;
+      haveChecksum = true;
+    }
   }
-  Serial.println();
-  Serial.print("Connected. IP address: ");
-  Serial.println(WiFi.localIP());
-  Serial.print("Set ESP32_HOST in send_image.py to: ");
-  Serial.println(WiFi.localIP());
+
+  uint8_t sum = 0;
+  for (size_t i = 0; i < NUMPIXELS; i++) sum += out[i];
+  return sum == checksum;
 }
 
 void setup() {
   Serial.begin(115200);
   delay(1000);
 
-  Serial.println("ESP32 LED Matrix starting...");
-
   pixels.begin();
   setColor(0, 0, 0);  // start with LEDs off
 
-  connectWiFi();
-  udp.begin(LISTEN_PORT);
-
-  Serial.print("Ready. Listening for image frames on UDP port ");
-  Serial.println(LISTEN_PORT);
+  Serial.println("ESP32 LED Matrix starting...");
+  Serial.println("Ready. Waiting for image frames over serial.");
 }
 
 void loop() {
-  // This project only needs to be reachable when you want to push an
-  // image, not continuously live -- so WiFi handling here is just a
-  // simple periodic retry while down, with no escalation, diagnostics, or
-  // visual "reconnecting" indicator to maintain.
-  if (WiFi.status() != WL_CONNECTED) {
-    if (millis() - lastReconnectAttempt >= WIFI_RECONNECT_INTERVAL) {
-      lastReconnectAttempt = millis();
-      WiFi.reconnect();
-    }
-    return;
-  }
+  if (!Serial.available()) return;
 
-  int packetSize = udp.parsePacket();
-  if (packetSize == NUMPIXELS) {
-    IPAddress sender = udp.remoteIP();
-    udp.read(imageBuffer, NUMPIXELS);
+  uint8_t b = Serial.read();
+  if (b != FRAME_MARKER) return;  // not a frame start -- ignore and keep scanning
+
+  if (readFrame(imageBuffer)) {
     displayImage(imageBuffer);
-    Serial.println("Displayed image frame.");
-
-    udp.beginPacket(sender, REPLY_PORT);
-    udp.print("OK: displayed image frame\n");
-    udp.endPacket();
-  } else if (packetSize > 0) {
-    // Not a full image frame -- drain and ignore it.
-    uint8_t discard[64];
-    while (udp.read(discard, sizeof(discard)) == sizeof(discard)) {}
+    Serial.println("OK: displayed image frame");
+  } else {
+    Serial.println("ERR: frame timeout or checksum mismatch");
   }
 }
