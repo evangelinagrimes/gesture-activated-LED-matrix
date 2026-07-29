@@ -78,7 +78,7 @@ pip install -r requirements.txt
 
    ```
    python send_image.py                    # sends the image at IMAGE_PATH
-   python send_image.py images/pic1.txt    # or send a specific file
+   python send_image.py images/attempt1.txt    # or send a specific file
    ```
 
    If the configured port can't be opened, the script lists the serial
@@ -86,11 +86,18 @@ pip install -r requirements.txt
 
 ## Tuning knobs
 
-`MATRIX_WIDTH` / `MATRIX_HEIGHT` (top of `send_image.py`) describe the
-physical matrix and must match `NUMPIXELS` in `led_matrix_esp.ino`.
-`BAUD_RATE` must match `Serial.begin()` there too. `SERIAL_TIMEOUT_S`
-controls how long the script waits for the ESP32's OK/ERR response
-before giving up (non-fatal either way); `BOOT_SETTLE_S` is how long it
-waits after opening the port before writing, since opening it resets most
-ESP32 boards (DTR/RTS toggling the auto-reset circuit) and the board
+`MATRIX_WIDTH` / `MATRIX_HEIGHT` (top of `send_image.py`, and again in
+`led_matrix_esp.ino`) describe the physical matrix and must match
+`NUMPIXELS`. `BAUD_RATE` must match `Serial.begin()` there too.
+`SERIAL_TIMEOUT_S` controls how long the script waits for the ESP32's
+OK/ERR response before giving up (non-fatal either way); `BOOT_SETTLE_S`
+is how long it waits after opening the port before writing, since
+opening it resets most ESP32 boards (DTR/RTS toggling the auto-reset
+circuit) and the board needs to finish `setup()` first.
+
+`MATRIX_SERPENTINE` (top of `led_matrix_esp.ino`) accounts for how the
+panel is physically wired. Most pre-made 16x16 WS2812 panels wire
+alternate rows in reverse (serpentine/zigzag) rather than every row
+running left-to-right (raster) -- if a pushed image comes out completely
+scrambled despite a valid checksum, flip this constant and reflash.
 needs to finish `setup()` first.

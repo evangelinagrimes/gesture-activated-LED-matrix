@@ -60,7 +60,7 @@ import serial.tools.list_ports
 # (shows as something like "Silicon Labs CP210x" or "USB-SERIAL CH340").
 # Only one program can hold the port open at a time -- close the Arduino
 # Serial Monitor before running this.
-SERIAL_PORT = "COM5"   # <-- set to your ESP32's COM port
+SERIAL_PORT = "COM3"   # <-- set to your ESP32's COM port
 BAUD_RATE = 115200     # must match Serial.begin() in led_matrix_esp.ino
 SERIAL_TIMEOUT_S = 2.0        # how long to wait for the ESP32's ack (non-fatal)
 BOOT_SETTLE_S = 2.0           # opening the port can reset the board; give it time to finish setup()
@@ -76,7 +76,7 @@ MATRIX_HEIGHT = 16
 NUMPIXELS = MATRIX_WIDTH * MATRIX_HEIGHT
 
 # Default image to send if no path is given on the command line.
-IMAGE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "images", "pic1.txt")
+IMAGE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "images", "attempt1.txt")
 
 # Matches a hex byte literal like 0xFF or 0x0a. Deliberately format-agnostic
 # about what's around it, so it works equally on a full C header (variable
@@ -208,6 +208,14 @@ def send_image(path: str = IMAGE_PATH):
             # Opening the port toggles DTR/RTS on most ESP32 boards' USB-serial
             # chips, which resets the board -- give setup() time to finish
             # before writing, or the first frame gets lost while it reboots.
+            #
+            # Pin both lines low right away so they're already stable by the
+            # time we close the port below. Otherwise the *close* triggers a
+            # second DTR/RTS transition -- and therefore a second reset --
+            # right after the image displays, wiping it back to "off" even
+            # though the frame was received and rendered correctly.
+            ser.dtr = False
+            ser.rts = False
             time.sleep(BOOT_SETTLE_S)
             ser.reset_input_buffer()
             ser.write(frame)

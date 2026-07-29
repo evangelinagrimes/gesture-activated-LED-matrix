@@ -1,9 +1,18 @@
 #include <Adafruit_NeoPixel.h>
 
 #define LED_PIN 5
-#define NUMPIXELS 256
+#define MATRIX_WIDTH 16
+#define MATRIX_HEIGHT 16
+#define NUMPIXELS (MATRIX_WIDTH * MATRIX_HEIGHT)
 #define FRAME_MARKER 'I'       // sync byte marking the start of an image frame
 #define FRAME_TIMEOUT_MS 2000  // abort a partially-received frame after this long
+
+// Most pre-made 16x16 WS2812 panels wire alternate rows in reverse
+// (serpentine/zigzag) to shorten the trace run between rows, rather than
+// every row running left-to-right (raster). If the image comes out
+// looking scrambled/shredded despite send_image.py reporting a valid
+// checksum, flip this and reflash -- it's the classic tell.
+#define MATRIX_SERPENTINE true
 
 // Must match FRAME_MARKER / BAUD_RATE in send_image.py. Frame shape on the
 // wire: FRAME_MARKER + NUMPIXELS grayscale bytes (row-major) + 1 checksum
@@ -20,12 +29,17 @@ void setColor(uint8_t r, uint8_t g, uint8_t b) {
 }
 
 // Renders a raw single-byte-per-pixel grayscale frame (NUMPIXELS bytes,
-// row-major) pushed from the PC -- see send_image() in send_image.py.
-// Each byte becomes an equal R=G=B pixel value.
+// row-major, top-left to bottom-right) pushed from the PC -- see
+// send_image() in send_image.py. Each byte becomes an equal R=G=B pixel
+// value. Remaps row-major source coordinates onto the matrix's actual
+// physical wiring order (see MATRIX_SERPENTINE above) before writing.
 void displayImage(const uint8_t* gray) {
-  for (int i = 0; i < NUMPIXELS; i++) {
-    uint8_t v = gray[i];
-    pixels.setPixelColor(i, pixels.Color(v, v, v));
+  for (int y = 0; y < MATRIX_HEIGHT; y++) {
+    for (int x = 0; x < MATRIX_WIDTH; x++) {
+      int physX = (MATRIX_SERPENTINE && (y % 2 == 1)) ? (MATRIX_WIDTH - 1 - x) : x;
+      uint8_t v = gray[y * MATRIX_WIDTH + x];
+      pixels.setPixelColor(y * MATRIX_WIDTH + physX, pixels.Color(v, v, v));
+    }
   }
   pixels.show();
 }
