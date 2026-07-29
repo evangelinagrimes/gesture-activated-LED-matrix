@@ -100,4 +100,13 @@ panel is physically wired. Most pre-made 16x16 WS2812 panels wire
 alternate rows in reverse (serpentine/zigzag) rather than every row
 running left-to-right (raster) -- if a pushed image comes out completely
 scrambled despite a valid checksum, flip this constant and reflash.
-needs to finish `setup()` first.
+
+`BINARIZE` (top of `led_matrix_esp.ino`, on by default) thresholds each
+pixel to one of two solid colors (`COLOR_ON` / `COLOR_OFF`, default white
+/ black) instead of smooth grayscale -- good for markers, logos, and text,
+where intermediate gray from resizing/anti-aliasing just looks murky and
+true black is otherwise indistinguishable from the matrix being off. Set
+`COLOR_OFF` to any RGB value to give the "other" class its own visible
+color instead of leaving it dark; adjust `BINARIZE_THRESHOLD` if the
+split falls in the wrong place, or set `BINARIZE` to `false` for smooth
+grayscale rendering.
