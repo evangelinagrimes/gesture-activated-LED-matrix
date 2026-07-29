@@ -104,7 +104,17 @@ class MatrixLink:
             raise MatrixLinkError(str(e)) from e
         self._ser = ser
 
-    def close(self):
+    def close(self, final_payload: bytes = None):
+        """Close the port. If `final_payload` is given and the link is
+        still open, best-effort send it first -- errors are swallowed, same
+        as every other non-fatal send failure this module already tolerates
+        (e.g. ping()'s timeout): by the time you're closing, there's
+        nothing more useful to do with a failed last send."""
+        if final_payload is not None and self.is_open:
+            try:
+                self.send_rgb(final_payload)
+            except MatrixLinkError:
+                pass
         if self._ser is not None:
             try:
                 self._ser.close()

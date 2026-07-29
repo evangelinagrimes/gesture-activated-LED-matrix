@@ -105,6 +105,20 @@ def parse_args(argv=None):
     parser.add_argument(
         "--brightness", type=_int_range_type(0, 100), default=renderer.DEFAULTS.brightness,
         metavar="0-100", help="output brightness percent, applied last (default: %(default)s)")
+    parser.add_argument(
+        "--invert", action="store_true",
+        help="invert every channel (255-x) of the final composed image before sending")
+    parser.add_argument(
+        "--border", action="store_true",
+        help="draw a 1px border around the panel edge in --border-color")
+    parser.add_argument(
+        "--border-color", type=_color_type, default=renderer.DEFAULTS.border_color,
+        metavar="R,G,B", help="border color, only used with --border "
+                               "(default: matches --color-on)")
+    parser.add_argument(
+        "--background", type=_color_type, default=(0, 0, 0),
+        metavar="R,G,B", help="color transparent pixels are composited onto "
+                               "(raster images with an alpha channel only, default: %(default)s)")
     return parser.parse_args(argv)
 
 
@@ -125,7 +139,7 @@ def main(argv=None) -> int:
         return 0
 
     try:
-        img = image_loader.load_image(args.image)
+        img = image_loader.load_image(args.image, background=args.background)
     except image_loader.ImageLoadError as e:
         print(f"Error: could not load image from {args.image}: {e}")
         return 1
@@ -137,6 +151,9 @@ def main(argv=None) -> int:
         color_off=args.color_off,
         smooth=args.smooth,
         brightness=args.brightness,
+        invert=args.invert,
+        border=args.border,
+        border_color=args.border_color,
     )
 
     try:

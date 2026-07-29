@@ -76,6 +76,18 @@ WORKER_JOIN_TIMEOUT_S = 2.5
 DEFAULT_IMAGE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "images", "attempt1.txt")
 
 STATUS_COLORS = {"info": "#1a1a1a", "warning": "#a06000", "error": "#b00020"}
+DOT_CONNECTED = "#2e7d32"
+DOT_DISCONNECTED = "#888888"
+
+# which -> (state attr, button attr, color-picker dialog title, reload the
+# image source on change instead of just re-rendering). Background is the
+# only entry needing a reload -- see _on_pick_color/_reload_current_image.
+# Border has no entry of its own -- it always matches "on" (see renderer.py's
+# border_color=None fallback to color_on).
+_COLOR_PICKERS = {
+    "on": ("color_on", "btn_color_on", "Primary", False),
+    "background": ("background_color", "btn_background", "Background", True),
+}
 
 
 def _to_hex(rgb: tuple) -> str:
@@ -86,15 +98,17 @@ class MatrixApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         root.title("LED Matrix Control")
-        root.geometry("920x600")
-        root.minsize(820, 520)
         root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         # Image/render state (GUI thread only)
         self.img: "image_loader.LoadedImage | None" = None
         self.rgb = None                # last-rendered (H, W, 3) uint8 array
-        self.color_on = renderer.DEFAULTS.color_on
-        self.color_off = renderer.DEFAULTS.color_off
+        self.color_on = renderer.DEFAULTS.color_on   # also the border color -- see renderer.py
+        self.background_color = (0, 0, 0)   # blank-pixel color when var_background is on; see _current_background()
+        self._current_image_path = None     # last successfully loaded path, for reload on background change
+        self._raster_cache_path = None      # path the fields below were decoded from, or None
+        self._raster_cache_im = None        # decoded RGBA PIL.Image for _raster_cache_path (raster sources only)
+        self._raster_cache_size = None      # its (width, height) before resizing
         self._photo = None             # must stay referenced or PhotoImage goes blank
         self._canvas_img_id = None
         self._send_job = None          # after() id for the send debounce
@@ -115,9 +129,13 @@ class MatrixApp:
         self.var_threshold = tk.IntVar(value=renderer.DEFAULTS.threshold)
         self.var_smooth = tk.BooleanVar(value=renderer.DEFAULTS.smooth)
         self.var_brightness = tk.IntVar(value=renderer.DEFAULTS.brightness)
+        self.var_invert = tk.BooleanVar(value=renderer.DEFAULTS.invert)
+        self.var_border = tk.BooleanVar(value=renderer.DEFAULTS.border)
+        self.var_background = tk.BooleanVar(value=False)
         self.var_live = tk.BooleanVar(value=True)
 
         self._build_ui()
+        self._auto_size_window()
         self._on_refresh_ports()
         self._worker_thread.start()
         self.root.after(EVENT_POLL_MS, self._drain_events)
@@ -145,6 +163,20 @@ class MatrixApp:
         self._build_send(right)
 
         self._build_statusbar(outer)
+
+    def _auto_size_window(self):
+        """Size the window to whatever the control column actually needs,
+        clamped to the screen, instead of a fixed size that silently clips
+        controls as more get added -- a fixed 920x600 is what made the
+        brightness slider look like it had vanished (it was pushed below
+        the window's bottom edge, along with everything under it)."""
+        self.root.update_idletasks()
+        req_w = self.root.winfo_reqwidth()
+        req_h = self.root.winfo_reqheight()
+        margin = 80  # rough allowance for the title bar + taskbar
+        height = min(req_h, self.root.winfo_screenheight() - margin)
+        self.root.geometry(f"{req_w}x{height}")
+        self.root.minsize(req_w, height)
 
     def _build_preview(self, parent):
         frame = ttk.Frame(parent)
@@ -182,6 +214,19 @@ class MatrixApp:
         box.pack(fill="x", pady=(0, 8))
         ttk.Button(box, text="Open Image...", command=self._on_open_image).pack(fill="x")
 
+        bg_row = ttk.Frame(box)
+        bg_row.pack(fill="x", pady=(8, 0))
+        self.chk_background = ttk.Checkbutton(
+            bg_row, text="Background: OFF", variable=self.var_background,
+            style="Toolbutton", command=self._on_background_toggle)
+        self.chk_background.pack(side="left")
+        self.btn_background = self._make_color_button(
+            bg_row, "background", "Color", self.background_color, fg="white", enabled=False)
+        self.btn_background.pack(side="left", padx=(6, 0))
+        ttk.Label(box, text="Color for every blank pixel -- transparent PNG areas and "
+                             "the two-tone off color. Off = those LEDs stay dark.",
+                  foreground="#666", wraplength=180).pack(anchor="w", pady=(4, 0))
+
     def _build_render(self, parent):
         box = ttk.LabelFrame(parent, text="Rendering", padding=8)
         box.pack(fill="x", pady=(0, 8))
@@ -205,26 +250,42 @@ class MatrixApp:
                                            variable=self.var_smooth, command=self._on_settings_changed)
         self.chk_smooth.pack(anchor="w", pady=(4, 0))
 
-        colors_row = ttk.Frame(box)
-        colors_row.pack(fill="x", pady=(8, 0))
-        self.btn_color_on = tk.Button(colors_row, text="Color ON", bg=_to_hex(self.color_on),
-                                       command=lambda: self._on_pick_color("on"))
-        self.btn_color_on.pack(side="left", fill="x", expand=True)
-        self.btn_color_off = tk.Button(colors_row, text="Color OFF", bg=_to_hex(self.color_off),
-                                        fg="white", command=lambda: self._on_pick_color("off"))
-        self.btn_color_off.pack(side="left", fill="x", expand=True, padx=(6, 0))
+        self.btn_color_on = self._make_color_button(box, "on", "Primary Color", self.color_on)
+        self.btn_color_on.pack(fill="x", pady=(8, 0))
 
         ttk.Label(box, text="Brightness").pack(anchor="w", pady=(8, 0))
         ttk.Scale(box, from_=0, to=100, variable=self.var_brightness,
                   command=self._on_slider_changed).pack(fill="x")
+
+        self.chk_invert = ttk.Checkbutton(box, text="Invert colors", variable=self.var_invert,
+                                           command=self._on_settings_changed)
+        self.chk_invert.pack(anchor="w", pady=(8, 0))
+
+        # No color swatch of its own -- the border always matches Primary
+        # Color (renderer.py resolves border_color=None to color_on).
+        self.chk_border = ttk.Checkbutton(
+            box, text="Border: OFF", variable=self.var_border,
+            style="Toolbutton", command=self._on_border_toggle)
+        self.chk_border.pack(anchor="w", pady=(4, 0))
 
         ttk.Button(box, text="Reset to defaults", command=self._on_reset).pack(fill="x", pady=(8, 0))
 
     def _build_send(self, parent):
         box = ttk.LabelFrame(parent, text="Send", padding=8)
         box.pack(fill="x")
-        self.btn_send = ttk.Button(box, text="Send to Matrix", command=self._on_send, state="disabled")
-        self.btn_send.pack(fill="x")
+
+        send_row = ttk.Frame(box)
+        send_row.pack(fill="x")
+        # Always clickable -- _on_send reports "not connected"/"no image" via
+        # the status bar rather than the button just going dead, and this dot
+        # is the always-visible complement: green means a click will actually
+        # do something, gray means it won't.
+        self.status_dot = tk.Canvas(send_row, width=14, height=14, highlightthickness=0)
+        self.status_dot.pack(side="left", padx=(0, 6))
+        self._dot_id = self.status_dot.create_oval(2, 2, 12, 12, fill=DOT_DISCONNECTED, outline="")
+        self.btn_send = ttk.Button(send_row, text="Send to Matrix", command=self._on_send)
+        self.btn_send.pack(side="left", fill="x", expand=True)
+
         ttk.Checkbutton(box, text="Live update", variable=self.var_live).pack(anchor="w", pady=(6, 0))
 
     def _build_statusbar(self, parent):
@@ -240,9 +301,12 @@ class MatrixApp:
             mode=self.var_mode.get(),
             threshold=int(round(self.var_threshold.get())),
             color_on=self.color_on,
-            color_off=self.color_off,
+            color_off=self._current_background(),
             smooth=self.var_smooth.get(),
             brightness=int(round(self.var_brightness.get())),
+            invert=self.var_invert.get(),
+            border=self.var_border.get(),
+            # border_color omitted -- renderer.py falls back to color_on.
         )
 
     def _on_slider_changed(self, _value):
@@ -262,11 +326,41 @@ class MatrixApp:
         state = "disabled" if full_color else "normal"
         self.scale_threshold.configure(state=state)
         self.chk_smooth.configure(state=state)
-        self.btn_color_on.configure(state=state)
-        self.btn_color_off.configure(state=state)
+        # Primary Color feeds two-tone rendering AND the border (border
+        # always matches it -- see renderer.py), so it must stay enabled in
+        # full-color mode whenever the border is on, even though the rest
+        # of the two-tone controls above are disabled there.
+        primary_enabled = (not full_color) or self.var_border.get()
+        self.btn_color_on.configure(state=("normal" if primary_enabled else "disabled"))
+        # Background always matters (transparency compositing works in
+        # both modes), so it's never gated on `mode` here.
 
         has_color = self.img is not None and self.img.rgb is not None
         self.radio_full_color.configure(state=("normal" if has_color else "disabled"))
+
+    def _make_color_button(self, parent, which: str, text: str, color: tuple,
+                            fg: str = None, enabled: bool = True) -> tk.Button:
+        """Build a swatch button wired to _on_pick_color(which). Only
+        constructs the button -- callers still .pack() it themselves, since
+        layout (fill/expand vs. a small fixed swatch) varies by call site."""
+        kwargs = {"text": text, "bg": _to_hex(color), "command": lambda: self._on_pick_color(which)}
+        if fg:
+            kwargs["fg"] = fg
+        if not enabled:
+            kwargs["state"] = "disabled"
+        return tk.Button(parent, **kwargs)
+
+    @staticmethod
+    def _set_swatch_enabled(button: tk.Button, enabled: bool):
+        button.configure(state=("normal" if enabled else "disabled"))
+
+    def _on_border_toggle(self):
+        is_on = self.var_border.get()
+        self.chk_border.configure(text=f"Border: {'ON' if is_on else 'OFF'}")
+        # Toggling border can change whether Primary Color needs to be
+        # enabled in full-color mode -- see _update_control_states.
+        self._update_control_states()
+        self._on_settings_changed()
 
     def _on_settings_changed(self, *_):
         if self.img is None:
@@ -299,12 +393,20 @@ class MatrixApp:
         self.var_threshold.set(renderer.DEFAULTS.threshold)
         self.var_smooth.set(renderer.DEFAULTS.smooth)
         self.var_brightness.set(renderer.DEFAULTS.brightness)
+        self.var_invert.set(renderer.DEFAULTS.invert)
+        self.var_border.set(renderer.DEFAULTS.border)
+        self.var_background.set(False)
         self.color_on = renderer.DEFAULTS.color_on
-        self.color_off = renderer.DEFAULTS.color_off
+        self.background_color = (0, 0, 0)
         self.btn_color_on.configure(bg=_to_hex(self.color_on))
-        self.btn_color_off.configure(bg=_to_hex(self.color_off))
+        self.btn_background.configure(bg=_to_hex(self.background_color))
+        self.chk_background.configure(text="Background: OFF")
+        self.chk_border.configure(text="Border: OFF")
+        self._set_swatch_enabled(self.btn_background, False)
         self._update_control_states()
-        self._on_settings_changed()
+        # A reload (not just a re-render) since the background may have
+        # just changed -- see _reload_current_image.
+        self._reload_current_image("Reset to defaults.")
 
     # ------------------------------------------------------------------
     # Image loading
@@ -324,9 +426,26 @@ class MatrixApp:
             return
         self._load_image_path(path)
 
-    def _load_image_path(self, path: str):
+    def _current_background(self) -> tuple:
+        return self.background_color if self.var_background.get() else (0, 0, 0)
+
+    def _decode_and_composite(self, path: str) -> "image_loader.LoadedImage":
+        """Like image_loader.load_image(), but caches the decoded raster
+        source per path so repeated background-color changes on the same
+        image (see _reload_current_image) recomposite in memory instead of
+        re-reading and re-decoding the file from disk every time."""
+        ext = os.path.splitext(path)[1].lower()
+        if ext not in image_loader.RASTER_EXTS:
+            return image_loader.load_image(path, background=self._current_background())
+        if self._raster_cache_path != path:
+            self._raster_cache_im, self._raster_cache_size = image_loader.decode_raster(path)
+            self._raster_cache_path = path
+        return image_loader.composite_raster(
+            self._raster_cache_im, self._current_background(), path, self._raster_cache_size)
+
+    def _load_image_path(self, path: str, status_msg: str = None):
         try:
-            img = image_loader.load_image(path)
+            img = self._decode_and_composite(path)
         except image_loader.ImageLoadError as e:
             # Keep whatever was previously loaded -- a bad file shouldn't
             # blank out a perfectly good preview.
@@ -335,14 +454,29 @@ class MatrixApp:
             return
 
         self.img = img
+        self._current_image_path = path
         self.lbl_image_path.configure(text=os.path.basename(path))
         self.lbl_image_info.configure(text=f"{img.source_size[0]}x{img.source_size[1]} source")
         if img.rgb is None and self.var_mode.get() == renderer.FULL_COLOR:
             self.var_mode.set(renderer.TWO_TONE)
         self._update_control_states()
         self._on_settings_changed()
-        self.btn_send.configure(state=("normal" if self.connected else "disabled"))
-        self._set_status(f"Loaded {os.path.basename(path)}.", "info")
+        self._set_status(status_msg or f"Loaded {os.path.basename(path)}.", "info")
+
+    def _reload_current_image(self, status_msg: str = None):
+        # Background compositing needs the original alpha channel, which is
+        # gone once .img is cached as flattened RGB -- so a background
+        # change has to recomposite from the source rather than just
+        # re-render like other settings. _decode_and_composite's cache
+        # means this only re-decodes from disk the first time per path.
+        if self._current_image_path is not None:
+            self._load_image_path(self._current_image_path, status_msg=status_msg)
+
+    def _on_background_toggle(self):
+        is_on = self.var_background.get()
+        self.chk_background.configure(text=f"Background: {'ON' if is_on else 'OFF'}")
+        self._set_swatch_enabled(self.btn_background, is_on)
+        self._reload_current_image("Background updated.")
 
     # ------------------------------------------------------------------
     # Connection
@@ -381,7 +515,7 @@ class MatrixApp:
         self.connected = connected
         self.btn_connect.configure(state="normal", text=("Disconnect" if connected else "Connect"))
         self.lbl_firmware.configure(text=info if connected else "")
-        self.btn_send.configure(state=("normal" if (connected and self.img is not None) else "disabled"))
+        self.status_dot.itemconfig(self._dot_id, fill=(DOT_CONNECTED if connected else DOT_DISCONNECTED))
 
     # ------------------------------------------------------------------
     # Sending
@@ -392,11 +526,17 @@ class MatrixApp:
             self.root.after_cancel(self._send_job)
         self._send_job = self.root.after(SEND_DEBOUNCE_MS, self._push_frame)
 
-    def _push_frame(self):
+    def _push_frame(self, payload: bytes = None):
+        """Queue a frame for the worker to send. With no argument, sends
+        the current render (the debounced/live-update/Send-button path,
+        gated on having something connected to send to); pass `payload`
+        explicitly to queue something else regardless of that gate (see
+        _on_close's blank-on-exit frame)."""
         self._send_job = None
-        if self.rgb is None or not self.connected:
-            return
-        payload = renderer.to_payload(self.rgb)
+        if payload is None:
+            if self.rgb is None or not self.connected:
+                return
+            payload = renderer.to_payload(self.rgb)
         # Latest-wins: drop whatever's queued before adding the new one, so
         # the worker never sends a stale frame from mid-drag (see module
         # docstring).
@@ -429,7 +569,17 @@ class MatrixApp:
 
             if cmd == "quit":
                 if link is not None:
-                    link.close()
+                    # Best-effort: send whatever's queued (the GUI queues a
+                    # blank frame right before this command -- see
+                    # _on_close) so the panel goes dark on exit instead of
+                    # showing the last image forever. MatrixLink.close()
+                    # does the send-then-close itself, swallowing failures
+                    # the same way ping()'s timeout already is elsewhere.
+                    try:
+                        payload = self.frame_q.get_nowait()
+                    except queue.Empty:
+                        payload = None
+                    link.close(final_payload=payload)
                 return
 
             elif cmd == "connect":
@@ -507,24 +657,25 @@ class MatrixApp:
         self.lbl_status.configure(text=text, foreground=STATUS_COLORS.get(kind, "#1a1a1a"))
 
     def _on_pick_color(self, which: str):
-        current = self.color_on if which == "on" else self.color_off
+        attr, btn_attr, title, reload_source = _COLOR_PICKERS[which]
+        current = getattr(self, attr)
         _, hex_str = colorchooser.askcolor(
-            color=_to_hex(current), parent=self.root,
-            title=f"Choose {'ON' if which == 'on' else 'OFF'} color")
+            color=_to_hex(current), parent=self.root, title=f"Choose {title} color")
         if hex_str is None:
             return  # cancelled
         rgb = tuple(int(hex_str[i:i + 2], 16) for i in (1, 3, 5))
-        if which == "on":
-            self.color_on = rgb
-            self.btn_color_on.configure(bg=hex_str)
+        setattr(self, attr, rgb)
+        getattr(self, btn_attr).configure(bg=hex_str)
+        if reload_source:
+            self._reload_current_image("Background color updated.")
         else:
-            self.color_off = rgb
-            self.btn_color_off.configure(bg=hex_str)
-        self._on_settings_changed()
+            self._on_settings_changed()
 
     def _on_close(self):
         if self._send_job is not None:
             self.root.after_cancel(self._send_job)
+        if self.connected:
+            self._push_frame(renderer.blank_payload())
         self.cmd_q.put(("quit", None))
         self._worker_thread.join(timeout=WORKER_JOIN_TIMEOUT_S)
         self.root.destroy()

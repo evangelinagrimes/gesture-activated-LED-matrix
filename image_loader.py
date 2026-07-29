@@ -172,8 +172,17 @@ def _load_hex(path: str) -> LoadedImage:
     return LoadedImage(gray=gray, rgb=None, path=path, source_size=(width, height))
 
 
-def _load_raster(path: str) -> LoadedImage:
-    """Load a regular raster image (PNG/JPG/etc.) via Pillow.
+def decode_raster(path: str):
+    """Decode a raster file into an RGBA PIL.Image (exif-transposed; an
+    opaque alpha channel is added if the source didn't have one) plus its
+    original (pre-resize) size -- the I/O half of _load_raster(), with no
+    background compositing or matrix resizing done yet.
+
+    Split out from _load_raster()/composite_raster() so a caller that needs
+    to recomposite the same source against different background colors
+    (the GUI's background-color picker, see gui.py's _decode_and_composite)
+    can decode once and reuse it, instead of re-reading and re-decoding the
+    file from disk on every color change.
 
     Pillow, not cv2.imread, on purpose: cv2.imread silently returns None for
     paths containing non-ASCII characters on Windows, which would surface as
@@ -184,29 +193,51 @@ def _load_raster(path: str) -> LoadedImage:
         with Image.open(path) as im:
             im = ImageOps.exif_transpose(im)
             source_size = im.size  # (width, height), before any resizing
-            if im.mode in ("RGBA", "LA", "P"):
-                im = im.convert("RGBA")
-                # Flatten transparency onto black -- convert("L")/convert("RGB")
-                # on a transparent PNG otherwise treats the transparent area as
-                # white, which would light up the whole panel around the subject.
-                background = Image.new("RGBA", im.size, (0, 0, 0, 255))
-                im = Image.alpha_composite(background, im)
-            rgb_full = np.asarray(im.convert("RGB"), dtype=np.uint8)
-            gray_full = np.asarray(im.convert("L"), dtype=np.uint8)
+            im = im.convert("RGBA")
     except (OSError, ValueError) as e:
         raise ImageLoadError(str(e)) from e
+    return im, source_size
 
+
+def composite_raster(im: Image.Image, background: tuple, path: str, source_size: tuple) -> LoadedImage:
+    """Flatten an already-decoded RGBA image (see decode_raster) onto
+    `background` and resize to the matrix.
+
+    Safe to call unconditionally even for sources that never had an alpha
+    channel: alpha_composite() over fully-opaque pixels is a no-op, so
+    `background` only visibly matters where the source actually had
+    transparency -- convert("L")/convert("RGB") on a transparent PNG
+    without this would otherwise treat the transparent area as white, which
+    would light up the whole panel around the subject.
+    """
+    bg = Image.new("RGBA", im.size, tuple(background) + (255,))
+    composited = Image.alpha_composite(bg, im)
+    rgb_full = np.asarray(composited.convert("RGB"), dtype=np.uint8)
+    gray_full = np.asarray(composited.convert("L"), dtype=np.uint8)
     gray = _resize_to_matrix(gray_full)
     rgb = _resize_to_matrix(rgb_full)
     return LoadedImage(gray=gray, rgb=rgb, path=path, source_size=source_size)
 
 
-def load_image(path: str) -> LoadedImage:
+def _load_raster(path: str, background: tuple = (0, 0, 0)) -> LoadedImage:
+    """Load a regular raster image (PNG/JPG/etc.) via Pillow -- decode_raster()
+    then composite_raster() in one shot, for callers that don't need to
+    reuse the decoded source across multiple background colors."""
+    im, source_size = decode_raster(path)
+    return composite_raster(im, background, path, source_size)
+
+
+def load_image(path: str, background: tuple = (0, 0, 0)) -> LoadedImage:
     """Load path, dispatching on file extension to the hex-dump loader or
-    the raster-image loader. Raises ImageLoadError on any problem."""
+    the raster-image loader. Raises ImageLoadError on any problem.
+
+    `background` is the color transparent pixels are flattened onto -- only
+    meaningful for raster sources with an alpha channel; hex dumps carry no
+    transparency and ignore it.
+    """
     ext = os.path.splitext(path)[1].lower()
     if ext in RASTER_EXTS:
-        return _load_raster(path)
+        return _load_raster(path, background=background)
     if ext in HEX_EXTS:
         return _load_hex(path)
     raise ImageLoadError(

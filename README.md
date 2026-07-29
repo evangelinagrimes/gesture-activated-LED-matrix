@@ -69,6 +69,41 @@ Brightness is applied last, as a uniform scale on the final RGB output --
 never to the grayscale input -- so it can't interact with the threshold
 decision.
 
+### Invert, border, and background
+
+- **Invert colors** — flips every channel (`255-x`) of the final composed
+  image (mode output and border both), right before brightness is applied.
+  CLI: `--invert`.
+- **Border** — a 1px frame around the outer edge of the panel, toggled on
+  its own (GUI: "Border" button; CLI: `--border`). It always matches the
+  Primary Color (`--color-on`) unless overridden with `--border-color
+  R,G,B` on the CLI -- the GUI has no separate border-color picker on
+  purpose, since "border matches the primary squares" is the point.
+- **Background** (GUI: "Image" box; CLI: `--background R,G,B`) — the color
+  used for *every* blank/off pixel, not just transparent ones: it's both
+  the two-tone off color and what transparent PNG areas are composited
+  onto. In the GUI it's a toggle -- on uses the color swatch next to it,
+  off turns those LEDs off (black). Changing it (or the toggle) reloads
+  the current image, since transparency compositing needs the original
+  alpha channel, which is gone once an image is cached as flattened RGB --
+  the GUI caches the decoded source per file so this recomposites in
+  memory rather than re-reading the file from disk every time. The CLI's
+  `--color-off` and `--background` remain independent flags (no on/off
+  toggle to unify there), so the two front ends aren't in lockstep here --
+  intentional, not drift.
+
+### Connection status dot
+
+The Send button next to it is always clickable -- it's not gated on being
+connected -- and instead reports "Not connected."/"No image loaded." in the
+status bar if you click it without either. The dot is the at-a-glance
+version of that: green while connected, gray otherwise.
+
+### Blanking on exit
+
+Closing the GUI window sends one all-off frame before disconnecting, so the
+panel goes dark instead of continuing to show whatever was last pushed.
+
 ## Hardware
 
 - ESP32 DevKit V1 (or similar), connected to the PC by USB
@@ -120,6 +155,8 @@ python send_image.py                                    # sends the default imag
 python send_image.py images/attempt1.txt                # or a specific file
 python send_image.py logo.png --full-color --brightness 40
 python send_image.py --port COM5 --color-on 255,0,0 --threshold 90
+python send_image.py logo.png --invert --border --border-color 0,255,0
+python send_image.py logo.png --background 0,255,0        # composite transparent pixels onto green
 python send_image.py --list-ports
 ```
 
@@ -141,6 +178,12 @@ blocking on it unconditionally). Both the CLI and GUI pin DTR/RTS low
 *before* opening the port so a subsequent close doesn't trigger a second
 reset that would blank whatever the panel was just showing.
 
+`renderer.PANEL_MIRROR_X` (top of `renderer.py`, default `True` for this
+panel) flips the payload left-right in `to_payload()` only -- the preview
+is unaffected, same as `MATRIX_SERPENTINE` below -- for panels physically
+mounted mirrored relative to how the image looks on screen. Flip it back to
+`False` if you're driving an unmirrored panel.
+
 `MATRIX_SERPENTINE` (top of `led_matrix_esp.ino`) accounts for how the
 panel is physically wired. Most pre-made 16x16 WS2812 panels wire
 alternate rows in reverse (serpentine/zigzag) rather than every row
@@ -150,3 +193,19 @@ lives in firmware (not as a PC-side setting) because it's a property of
 the panel's wiring, not a rendering style choice -- the GUI's preview
 always shows the logical (un-remapped) image, so "preview looks right but
 the panel is scrambled" means this constant, not a bug in the Python side.
+
+## Known issues
+
+- **Brightness shifts color on the panel, not just intensity.** Reported
+  while testing the brightness slider: dragging it visibly changes the hue
+  on the physical LEDs, not only how bright they are. `render_rgb()` scales
+  R/G/B by the same factor (`renderer.py`'s `rgb * (brightness / 100.0)`),
+  which is hue-preserving in exact arithmetic -- so the preview (built from
+  that same array) never shows this. Two candidate causes, neither yet
+  confirmed against hardware: (1) integer rounding of the scaled channels
+  before sending -- at low absolute channel values the `+0.5` rounding
+  error is proportionally larger, which can drift the R:G:B ratio as
+  brightness drops; (2) the WS2812 LEDs' own PWM response may not be
+  linear (or matched across channels) at low duty cycles. Needs
+  reproducing on the actual panel across a few brightness/color
+  combinations before picking a fix.
