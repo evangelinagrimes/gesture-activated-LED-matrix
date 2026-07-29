@@ -1,51 +1,73 @@
 # LED Matrix
 
 Push a static image to a 256-LED NeoPixel matrix from a PC over a direct
-USB serial connection. This is a static, on-demand project: there's no
-live detection loop and no requirement that the PC and ESP32 stay
-continuously connected — you run a script, it sends one image, the
-matrix updates.
+USB serial connection, either from a GUI (color pickers, brightness slider,
+live preview) or a one-shot CLI script. This is a static, on-demand
+project: there's no live detection loop and no requirement that the PC and
+ESP32 stay continuously connected.
 
 ## How it works
 
 ```
- hex image file --> send_image.py --> USB serial (framed 256-byte image) --> ESP32 --> NeoPixel matrix
-                                    <------------- OK / ERR line -------
+ image file --> image_loader.py --> renderer.py --> matrix_link.py --> USB serial --> ESP32 --> NeoPixel matrix
+                                          |                                        <-- OK/ERR line --
+                                          v
+                                  gui.py's live preview
 ```
 
-**`send_image.py`** (runs on your PC) reads a hex-literal image file,
-converts it to a grayscale byte-per-pixel frame sized to the matrix, and
-writes it to the ESP32's serial port as one framed message (a marker
-byte + the 256 pixel bytes + a checksum). It waits briefly for the
-ESP32's OK/ERR response as a courtesy, but not hearing one back isn't
-treated as an error -- the two devices don't need to stay connected
-between pushes.
+The pipeline is split into small, reusable pieces:
 
-**`led_matrix_esp/led_matrix_esp.ino`** (runs on the ESP32) watches its
-serial input for that marker byte, reads the frame that follows, checks
-the checksum, and renders it directly to the NeoPixel matrix if it's
-intact. There's no WiFi, no network config, and no live session to keep
-alive between image pushes -- just the USB cable.
+- **`image_loader.py`** loads an image (a hex-literal dump or a regular
+  PNG/JPG/etc.) into a 16x16 grayscale array, plus a color array when the
+  source actually has one.
+- **`renderer.py`** turns that plus your chosen settings (two-tone vs. full
+  color, threshold, colors, brightness) into the exact RGB array the panel
+  will show. This one function feeds *both* the wire payload and the
+  on-screen preview, so the preview can never drift from what the panel
+  actually displays.
+- **`matrix_link.py`** owns the serial connection and speaks the wire
+  protocol (framing, checksums, acks).
+- **`gui.py`** is the interactive control panel: pick colors, drag
+  brightness/threshold sliders with a live preview, and push updates to
+  the matrix in real time or with an explicit Send button.
+- **`send_image.py`** is a scriptable one-shot CLI over the same pipeline,
+  for automation or quick sends without opening the GUI.
+- **`led_matrix_esp/led_matrix_esp.ino`** (runs on the ESP32) is a dumb RGB
+  framebuffer: it just renders whatever RGB888 frame it's handed. All
+  color/brightness decisions happen on the PC now, so nothing on the panel
+  requires a reflash to change.
 
 ### Image format
 
-Point `IMAGE_PATH` (top of `send_image.py`), or pass a path as a command
-line argument, at a hex-literal image file — either:
+Either a GUI "Open Image..." or a CLI path argument accepts:
 
-- **image2cpp-style, any resolution** — a `..._width`/`..._height`
-  declaration plus a packed pixel array at 1, 4, or 8 bits per pixel
-  (auto-detected from the byte count). The source image does **not**
-  need to already be 16x16: `load_image_bytes()` downsamples
-  (area-averaged) or upsamples (nearest-neighbor) it to the matrix's
-  resolution automatically.
-- **A flat 256-byte dump** — if the file has no width/height metadata,
-  it's assumed to already be exactly `NUMPIXELS` (256) grayscale bytes,
-  one per LED, row-major.
+- **Any regular image** (`.png`, `.jpg`, `.jpeg`, `.bmp`, `.gif`, `.webp`) —
+  loaded via Pillow, resized to the matrix automatically.
+- **A hex-literal dump** (`.h`, `.hpp`, `.c`, `.inc`, `.txt`) — either
+  image2cpp-style (`..._width`/`..._height` declarations plus a packed
+  pixel array at 1, 4, or 8 bits per pixel, auto-detected from the byte
+  count) at any resolution, or a flat 256-byte grayscale dump with no
+  metadata, matching the matrix 1:1. The parser just scans for `0xNN`
+  tokens, so it doesn't care about the surrounding syntax.
 
-Either way, the parser just scans the file for `0xNN` tokens, so it
-doesn't care whether the surrounding syntax is a `.h` C header or a plain
-comma-separated `.txt`. See [`images/README.md`](images/README.md) for
-more detail, and drop your own files in `images/`.
+See [`images/README.md`](images/README.md) for hex-format detail, and drop
+your own files in `images/`.
+
+### Rendering modes
+
+- **Two-tone** (default) — each pixel is thresholded and rendered as one
+  of two solid colors (`color_on`/`color_off`, default white/black).
+  Good for markers, logos, and text, where intermediate gray from
+  resizing/anti-aliasing just looks murky. Check "Smooth ramp" (GUI) or
+  pass `--smooth` (CLI) to ramp between the two colors instead of hard
+  thresholding -- this degrades to plain grayscale when the colors are
+  black/white.
+- **Full color** — shows the source image's actual colors. Only available
+  for raster images; hex dumps carry no color data.
+
+Brightness is applied last, as a uniform scale on the final RGB output --
+never to the grayscale input -- so it can't interact with the threshold
+decision.
 
 ## Hardware
 
@@ -60,9 +82,15 @@ more detail, and drop your own files in `images/`.
 1. Open `led_matrix_esp/led_matrix_esp.ino` in the Arduino IDE.
 2. Install the `Adafruit NeoPixel` library (Library Manager).
 3. Flash it, then open the Serial Monitor at 115200 baud to confirm it
-   prints `Ready. Waiting for image frames over serial.` — then close the
-   Serial Monitor again (only one program can hold the port open at a time,
-   and `send_image.py` needs it next).
+   prints `Ready. Waiting for frames over serial.` — then close the Serial
+   Monitor again (only one program can hold the port open at a time, and
+   the GUI/CLI needs it next).
+
+This firmware speaks an RGB888 protocol (see `matrix_link.py`'s module
+docstring for the exact framing) and identifies itself as
+`OK: led-matrix RGB888 16x16 v2` in response to a ping. If you have an
+older grayscale-only build flashed, reflash before using the GUI/CLI --
+the two don't interoperate.
 
 ### Python side
 
@@ -70,43 +98,55 @@ more detail, and drop your own files in `images/`.
 pip install -r requirements.txt
 ```
 
-1. Find the ESP32's COM port in Windows' Device Manager, under
-   "Ports (COM & LPT)", once it's plugged in (shows as something like
-   "Silicon Labs CP210x" or "USB-SERIAL CH340"). Set `SERIAL_PORT` at the
-   top of `send_image.py` to it.
-2. Run it:
+Find the ESP32's COM port in Windows' Device Manager, under
+"Ports (COM & LPT)", once it's plugged in (shows as something like
+"Silicon Labs CP210x" or "USB-SERIAL CH340").
 
-   ```
-   python send_image.py                    # sends the image at IMAGE_PATH
-   python send_image.py images/attempt1.txt    # or send a specific file
-   ```
+**GUI** (recommended for interactive use):
 
-   If the configured port can't be opened, the script lists the serial
-   ports it actually found to help you pick the right one.
+```
+python gui.py
+```
+
+Pick the port from the dropdown and hit Connect, then Open Image, adjust
+colors/threshold/brightness, and either drag with "Live update" checked
+(pushes to the matrix as you go) or use the Send button. The preview
+canvas always shows exactly what the render settings will produce.
+
+**CLI** (for scripting or a quick one-off send):
+
+```
+python send_image.py                                    # sends the default image
+python send_image.py images/attempt1.txt                # or a specific file
+python send_image.py logo.png --full-color --brightness 40
+python send_image.py --port COM5 --color-on 255,0,0 --threshold 90
+python send_image.py --list-ports
+```
+
+Set `SERIAL_PORT` at the top of `send_image.py` if you'd rather not pass
+`--port` every time. If the port can't be opened, both the GUI and CLI
+list the serial ports they actually found to help you pick the right one.
 
 ## Tuning knobs
 
-`MATRIX_WIDTH` / `MATRIX_HEIGHT` (top of `send_image.py`, and again in
-`led_matrix_esp.ino`) describe the physical matrix and must match
-`NUMPIXELS`. `BAUD_RATE` must match `Serial.begin()` there too.
-`SERIAL_TIMEOUT_S` controls how long the script waits for the ESP32's
-OK/ERR response before giving up (non-fatal either way); `BOOT_SETTLE_S`
-is how long it waits after opening the port before writing, since
-opening it resets most ESP32 boards (DTR/RTS toggling the auto-reset
-circuit) and the board needs to finish `setup()` first.
+`MATRIX_WIDTH`/`MATRIX_HEIGHT` (top of `image_loader.py`, and again in
+`led_matrix_esp.ino`) describe the physical matrix; their product must
+match `NUMPIXELS` in the firmware. `matrix_link.BAUD_RATE` must match
+`Serial.begin()` there too. `matrix_link.ACK_TIMEOUT_S` controls how long
+a send waits for the ESP32's ack before giving up (not fatal -- the frame
+likely still displayed); `BOOT_SETTLE_S` is how long the CLI waits after
+opening the port before writing, since opening it resets most ESP32
+boards (the GUI instead pings and retries after this delay, rather than
+blocking on it unconditionally). Both the CLI and GUI pin DTR/RTS low
+*before* opening the port so a subsequent close doesn't trigger a second
+reset that would blank whatever the panel was just showing.
 
 `MATRIX_SERPENTINE` (top of `led_matrix_esp.ino`) accounts for how the
 panel is physically wired. Most pre-made 16x16 WS2812 panels wire
 alternate rows in reverse (serpentine/zigzag) rather than every row
 running left-to-right (raster) -- if a pushed image comes out completely
-scrambled despite a valid checksum, flip this constant and reflash.
-
-`BINARIZE` (top of `led_matrix_esp.ino`, on by default) thresholds each
-pixel to one of two solid colors (`COLOR_ON` / `COLOR_OFF`, default white
-/ black) instead of smooth grayscale -- good for markers, logos, and text,
-where intermediate gray from resizing/anti-aliasing just looks murky and
-true black is otherwise indistinguishable from the matrix being off. Set
-`COLOR_OFF` to any RGB value to give the "other" class its own visible
-color instead of leaving it dark; adjust `BINARIZE_THRESHOLD` if the
-split falls in the wrong place, or set `BINARIZE` to `false` for smooth
-grayscale rendering.
+scrambled despite a valid checksum, flip this constant and reflash. This
+lives in firmware (not as a PC-side setting) because it's a property of
+the panel's wiring, not a rendering style choice -- the GUI's preview
+always shows the logical (un-remapped) image, so "preview looks right but
+the panel is scrambled" means this constant, not a bug in the Python side.

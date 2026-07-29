@@ -1,10 +1,13 @@
 # Images
 
-Drop your hex-literal image file(s) here, then either point `IMAGE_PATH`
-(top of `send_image.py`) at the one you want to send by default, or pass
-its path as a command-line argument: `python send_image.py images/foo.h`.
+Drop your image file(s) here (hex dumps or regular PNG/JPG/etc. both
+work), then either load one from the GUI's "Open Image..." button, point
+`IMAGE_PATH` (top of `send_image.py`) at the one you want the CLI to send
+by default, or pass its path as a command-line argument:
+`python send_image.py images/foo.h`.
 
-`load_image_bytes()` accepts either:
+`image_loader.load_image()` accepts either a regular raster image or a
+hex-literal dump. For hex dumps:
 
 - **image2cpp-style, any resolution** — a `..._width`/`..._height`
   declaration plus a packed pixel array at 1, 4, or 8 bits per pixel
