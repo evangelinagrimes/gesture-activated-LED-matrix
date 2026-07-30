@@ -1,0 +1,18 @@
+# Placeholder sprite: peace (16x16, blue V-sign over a palm base).
+# Replace with peace.png for real artwork -- see sprites/README.md.
+. . . 0000FF . . . . . . . . 0000FF . . .
+. . . 0000FF . . . . . . . . 0000FF . . .
+. . . . 0000FF . . . . . . 0000FF . . . .
+. . . . 0000FF . . . . . . 0000FF . . . .
+. . . . . 0000FF . . . . 0000FF . . . . .
+. . . . . 0000FF . . . . 0000FF . . . . .
+. . . . . . 0000FF . . 0000FF . . . . . .
+. . . . . . 0000FF . . 0000FF . . . . . .
+. . . . . . . 0000FF 0000FF . . . . . . .
+. . . . . . . 0000FF 0000FF . . . . . . .
+. . . . . . 0000FF 0000FF 0000FF 0000FF . . . . . .
+. . . . . 0000FF 0000FF 0000FF 0000FF 0000FF 0000FF . . . . .
+. . . . . 0000FF 0000FF 0000FF 0000FF 0000FF 0000FF . . . . .
+. . . . . 0000FF 0000FF 0000FF 0000FF 0000FF 0000FF . . . . .
+. . . . . 0000FF 0000FF 0000FF 0000FF 0000FF 0000FF . . . . .
+. . . . . 0000FF 0000FF 0000FF 0000FF 0000FF 0000FF . . . . .

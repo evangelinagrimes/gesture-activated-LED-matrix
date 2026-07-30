@@ -10,16 +10,16 @@ many recent pip installs (see: github.com/google-ai-edge/mediapipe issues
 #6200, #6204, #6261). This version avoids that problem entirely.
 
 Install dependencies:
-    pip install mediapipe opencv-python
+    pip install -r requirements.txt
 
 On first run, this script auto-downloads MediaPipe's pretrained gesture
 recognizer model file (gesture_recognizer.task, ~8MB) into the same folder
 as this script.
 
 Run:
-    python3 gesture_detection.py
+    python3 gesture.py
 
-Press 'q' to quit.
+Press 'q' to quit, 'r' to hot-reload sprites/ without restarting.
 
 Gesture classification is a hybrid: MediaPipe's pretrained recognizer
 handles Thumbs Up, Thumbs Down, Peace Sign, Open Palm, and Fist (each with
@@ -30,12 +30,27 @@ model has no category for: Pointing, OK Sign, Rock On.
 
 You can extend `classify_gesture()` with your own logic/gestures.
 
+--------------------------------------------------------------------------qqqqq
+ESP32 transport: USB serial (default) or WiFi UDP
 --------------------------------------------------------------------------
-ESP32 WiFi protocol (UDP)
---------------------------------------------------------------------------
-Detected gestures are sent to the ESP32 over WiFi as newline-terminated,
-UTF-8 UDP datagrams (e.g. b"thumbs_up\n") to ESP32_HOST:ESP32_PORT. Keep
-this label set in sync with whatever the ESP32 firmware switches on:
+Set TRANSPORT below to pick the link. "serial" (default) talks to the
+ESP32 over a USB cable (SERIAL_PORT/SERIAL_BAUD) and doesn't depend on WiFi
+at all -- see transport.py's SerialTransport. "udp" is the original WiFi
+link (ESP32_HOST/ESP32_PORT), with its own ICMP ping monitor and reconnect
+diagnostics -- see transport.py's UdpTransport.
+
+Whichever transport is active, gesture.py sends one message per confirmed
+gesture change, re-sending the same message every FRAME_REFRESH_S seconds
+(and immediately after a reconnect) so a dropped datagram or an ESP32
+reboot can't leave stale artwork on the panel indefinitely.
+
+Each message is either:
+  - a sprite frame, b"IMG1<label>\\n<768 bytes raw RGB>" (see sprites.py),
+    when sprites/<label>.* exists, or
+  - a plain label, b"<label>\\n", when it doesn't -- the ESP32 falls back
+    to its original flat gesture->color behavior for that label.
+
+Keep the label set in sync with whatever the ESP32 firmware switches on:
 
     thumbs_up
     thumbs_down
@@ -50,17 +65,14 @@ the ESP32 as "none". A gesture must hold steady for GESTURE_STABLE_FRAMES
 consecutive frames before it is sent, to avoid chattering the link on
 single-frame misclassifications.
 
-This script also binds LOCAL_UDP_PORT to receive debug/status datagrams
-back from the ESP32 (printed with an "[ESP32]" prefix). The ESP32 can
-reply to whatever address/port a gesture datagram arrived from (the
-standard UDP request/reply pattern), or push a datagram to
-LOCAL_UDP_PORT unsolicited at any time, e.g. a boot/WiFi-connected
-message before this script has sent any gesture yet.
+Status/debug lines the ESP32 sends back (heartbeats, boot/reset reason,
+WiFi reconnect reports) are printed with an "[ESP32]" prefix and surfaced
+in the debug dashboard (see dashboard.py) -- a second Tk window opened
+alongside the OpenCV video feed.
 
-Connection drops/recoveries (from both the ESP32's own UDP status lines
-and an independent ICMP ping check) are appended to esp32_connection.log
-next to this script, so a drop that happens unattended can still be
-diagnosed afterward -- see CONNECTION_LOG_PATH.
+Connection drops/recoveries are appended to esp32_connection.log next to
+this script, so a drop that happens unattended can still be diagnosed
+afterward -- see CONNECTION_LOG_PATH.
 --------------------------------------------------------------------------
 """
 
@@ -69,16 +81,17 @@ import math
 import re
 import time
 import atexit
-import socket
 import logging
-import subprocess
-import threading
-import urllib.request
+from collections import deque
 
 import cv2
 import mediapipe as mp
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision
+
+import transport
+import sprites
+import dashboard
 
 MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gesture_recognizer.task")
 MODEL_URL = (
@@ -86,12 +99,30 @@ MODEL_URL = (
     "gesture_recognizer/float16/1/gesture_recognizer.task"
 )
 
-# WiFi UDP connection to the ESP32. Fill in your ESP32's IP (a static IP or
-# DHCP reservation on your router is strongly recommended -- if it moves,
-# gestures silently go nowhere).
+# --- Transport selection -------------------------------------------------
+# "serial" (default): USB cable, doesn't depend on WiFi at all.
+# "udp": the original WiFi link, with ICMP ping + WiFi reconnect diagnostics.
+TRANSPORT = "serial"
+
+# Used when TRANSPORT == "serial".
+SERIAL_PORT = "COM3"
+SERIAL_BAUD = 115200
+# How often to retry opening the port after it's unavailable/dropped (cable
+# unplugged, or the ESP32 reset and briefly disappeared from the OS).
+SERIAL_REOPEN_INTERVAL_S = 2.0
+
+# Used when TRANSPORT == "udp". A static IP or DHCP reservation on your
+# router is strongly recommended -- if it moves, gestures silently go nowhere.
 ESP32_HOST = "192.168.8.182"   # <-- set to your ESP32's IP
 ESP32_PORT = 4210              # port the ESP32 listens on for gesture commands
 LOCAL_UDP_PORT = 4211          # port this script listens on for ESP32 debug messages
+
+# How often to re-send the currently-displayed gesture, regardless of
+# whether it changed. UDP can drop a datagram and USB can get unplugged --
+# either way, the render is idempotent, so this also self-heals an ESP32
+# reboot (including the DTR-triggered reset opening a serial port causes on
+# most dev boards) without needing a new gesture to arrive first.
+FRAME_REFRESH_S = 2.0
 
 # --- Tuning knobs -------------------------------------------------------
 # Minimum confidence from the pretrained recognizer before a gesture counts.
@@ -116,28 +147,22 @@ CAPTURE_HEIGHT = 480
 # inference pass for no effect unless you want the on-screen overlay for
 # a second hand too.
 NUM_HANDS = 1
-# Ceiling on ESP32 messages drained per read_esp32_output() call, so a
-# chatty or malfunctioning ESP32 can't stall the frame loop indefinitely.
-MAX_ESP32_MESSAGES_PER_READ = 20
 # How long without hearing anything from the ESP32 (it heartbeats every
-# HEARTBEAT_INTERVAL=5s in gesture-esp.ino) before treating it as
-# unreachable. A bit over 2x that, to tolerate a couple of dropped
-# heartbeats before flagging it.
+# HEARTBEAT_INTERVAL=5s in gesture-esp.ino, over whichever transport is
+# active) before treating it as unreachable. A bit over 2x that, to
+# tolerate a couple of dropped heartbeats before flagging it.
 ESP32_TIMEOUT_S = 12.0
 # Must match WIFI_RECONNECT_INTERVAL in gesture-esp.ino. Used only to
 # estimate how many reconnect attempts the ESP32 has likely made while
-# unreachable -- there's no way to hear the real count until it reconnects,
-# since no network path exists while WiFi is down.
+# unreachable over UDP -- there's no way to hear the real count until it
+# reconnects, since no network path exists while WiFi is down.
 ESP32_RECONNECT_INTERVAL_S = 5.0
 # How long to keep showing the ESP32's own reconnect report (attempts +
 # downtime, sent once right after it reconnects) before reverting to the
 # normal gesture status line.
 RECONNECT_NOTE_DISPLAY_S = 5.0
-# How often the background thread pings ESP32_HOST at the OS/ICMP level.
-# This is independent of the UDP heartbeat: if the ESP32 has actually
-# dropped off the network (vs. just gone quiet at the app layer), ICMP will
-# fail immediately rather than waiting out ESP32_TIMEOUT_S, and it also
-# still works if the ESP32's firmware is wedged but the network stack isn't.
+# How often the background thread pings ESP32_HOST at the OS/ICMP level
+# (TRANSPORT == "udp" only -- meaningless over a wired USB link).
 PING_INTERVAL_S = 3.0
 PING_TIMEOUT_MS = 1000
 
@@ -163,14 +188,23 @@ GESTURE_LABELS = {
     "Fist": "fist",
 }
 
-sock = None
-last_esp32_contact = None  # time.monotonic() of the last datagram received from the ESP32
+link = None  # the active Transport instance, set in main()
+last_esp32_contact = None  # time.monotonic() of the last line received from the ESP32
 
-# Parses the ESP32's "WiFi reconnected after N attempt(s), down for Xs"
-# status line (see maintainWiFi() in gesture-esp.ino).
-RECONNECT_REPORT_RE = re.compile(r"^WiFi reconnected after (\d+) attempt")
-last_reconnect_report = None      # (attempts: int, message: str) from the ESP32's own count
-last_reconnect_report_time = None  # time.monotonic() it arrived
+# --- ESP32 status-line parsing (transport-agnostic: both SerialTransport
+# and UdpTransport hand read_esp32_output() plain decoded lines) ---------
+HEARTBEAT_RE = re.compile(r"^\[HEARTBEAT\] Uptime: (\d+)s \| Gestures: (\d+)")
+BOOT_RE = re.compile(r"^ESP32 booted\..*Reset reason: (.+)$")
+RESET_REASON_RE = re.compile(r"^Reset reason: (.+)$")
+LAST_DISCONNECT_RE = re.compile(r"Last disconnect (.+)$")
+
+esp32_uptime_s = None
+esp32_gesture_count = None
+esp32_boot_reason = None
+esp32_last_disconnect_reason = None
+reconnects_this_session = 0
+messages_received = 0
+esp32_log = deque(maxlen=200)  # (text, is_connection_related), oldest first -- feeds the dashboard log
 
 # Persistent record of connection failures/recoveries, independent of the
 # on-screen overlay, so a drop that happens while no one's watching the
@@ -197,129 +231,50 @@ def _is_connection_related(line: str) -> bool:
     return any(keyword in lower for keyword in CONNECTION_LOG_KEYWORDS)
 
 
-# --- Independent ICMP ping monitor --------------------------------------
-# Runs on its own thread so it never blocks the frame loop. This is
-# deliberately separate from the UDP-heartbeat-based esp32_seems_connected()
-# check above: that one only tells you the *application* has gone quiet,
-# which can't distinguish "ESP32 fell off the network" from "ESP32 is alive
-# but its UDP send is failing" -- a raw ICMP ping tells you whether the host
-# is reachable on the network at all, independent of anything the ESP32
-# firmware is doing.
-ping_ok = None  # None = no ping attempted yet
-_ping_lock = threading.Lock()
-_ping_stop = threading.Event()
-
-
-def _ping_once(host: str, timeout_ms: int) -> bool:
-    if os.name == "nt":
-        cmd = ["ping", "-n", "1", "-w", str(timeout_ms), host]
+def create_transport():
+    if TRANSPORT == "serial":
+        return transport.SerialTransport(SERIAL_PORT, SERIAL_BAUD, SERIAL_REOPEN_INTERVAL_S)
+    elif TRANSPORT == "udp":
+        return transport.UdpTransport(ESP32_HOST, ESP32_PORT, LOCAL_UDP_PORT,
+                                       PING_INTERVAL_S, int(PING_TIMEOUT_MS), conn_logger)
     else:
-        cmd = ["ping", "-c", "1", "-W", str(max(1, timeout_ms // 1000)), host]
-    try:
-        result = subprocess.run(
-            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            timeout=(timeout_ms / 1000) + 2,
-        )
-        return result.returncode == 0
-    except (subprocess.TimeoutExpired, OSError):
-        return False
-
-
-def ping_monitor_loop():
-    """Background thread body: ping ESP32_HOST periodically, logging transitions."""
-    global ping_ok
-    while not _ping_stop.is_set():
-        ok = _ping_once(ESP32_HOST, PING_TIMEOUT_MS)
-        with _ping_lock:
-            first_result = ping_ok is None
-            changed = not first_result and ok != ping_ok
-            ping_ok = ok
-        if first_result:
-            conn_logger.info(f"[PING] Initial check: {ESP32_HOST} is "
-                              f"{'reachable' if ok else 'NOT reachable'}")
-        elif changed:
-            if ok:
-                conn_logger.info(f"[PING] {ESP32_HOST} is reachable again")
-            else:
-                conn_logger.warning(f"[PING] {ESP32_HOST} stopped responding to ICMP "
-                                     f"(host off the network, WiFi dropped, or ICMP blocked)")
-        _ping_stop.wait(PING_INTERVAL_S)
-
-
-def open_esp32_link():
-    """Open the UDP socket used to talk to the ESP32, if possible.
-
-    Failing to bind is non-fatal: gesture detection should keep working even
-    when the ESP32 isn't reachable. UDP has no handshake, so unlike the old
-    serial connection this always "succeeds" unless the local port is
-    already in use.
-    """
-    global sock
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.bind(("", LOCAL_UDP_PORT))
-        sock.setblocking(False)
-        print(f"Listening for ESP32 on UDP port {LOCAL_UDP_PORT}, "
-              f"sending gestures to {ESP32_HOST}:{ESP32_PORT}")
-    except OSError as e:
-        print(f"Warning: could not open UDP socket on port {LOCAL_UDP_PORT}: {e}")
-        print("Continuing without ESP32 connection.")
-        sock = None
-
-
-def close_esp32_link():
-    """Close the UDP socket, if it's open."""
-    if sock is not None:
-        sock.close()
-        print("ESP32 connection closed.")
-
-
-def send_gesture(gesture_name: str):
-    """Send a gesture label to the ESP32 as a newline-terminated UTF-8 UDP datagram."""
-    if sock is None:
-        return
-    try:
-        sock.sendto(f"{gesture_name}\n".encode("utf-8"), (ESP32_HOST, ESP32_PORT))
-        print(f"Sent gesture '{gesture_name}' to ESP32 at {ESP32_HOST}:{ESP32_PORT}")
-    except OSError as e:
-        print(f"Warning: failed to send gesture over UDP: {e}")
+        raise ValueError(f"Unknown TRANSPORT {TRANSPORT!r} (expected 'serial' or 'udp')")
 
 
 def read_esp32_output():
-    """Print any buffered debug/status datagrams the ESP32 has sent back.
+    """Drain and process buffered status/debug lines from the ESP32.
 
-    Non-blocking: a socket with setblocking(False) raises BlockingIOError
-    immediately when no datagram is waiting, so this never stalls the
-    detection loop.
+    Transport-agnostic: link.read_lines() already returns decoded,
+    newline-split text regardless of whether it came from a UDP datagram or
+    the serial port.
     """
-    global last_esp32_contact, last_reconnect_report, last_reconnect_report_time
-    if sock is None:
-        return
-    for _ in range(MAX_ESP32_MESSAGES_PER_READ):
-        try:
-            data, _addr = sock.recvfrom(1024)
-        except BlockingIOError:
-            break
-        except ConnectionResetError:
-            # Windows-only quirk: sending a UDP datagram to a port with no
-            # listener can make a *later* recv on this socket raise
-            # WinError 10054, even though UDP has no real "connection" to
-            # reset. It just means nothing was there to read -- same as
-            # BlockingIOError for our purposes.
-            break
-        except OSError as e:
-            print(f"Warning: failed to read from ESP32: {e}")
-            break
-        last_esp32_contact = time.monotonic()  # any datagram at all counts as "still alive"
-        line = data.decode("utf-8", errors="ignore").strip()
-        if line:
-            print(f"[ESP32] {line}")
-            if _is_connection_related(line):
-                conn_logger.info(f"[ESP32] {line}")
-            match = RECONNECT_REPORT_RE.match(line)
-            if match:
-                last_reconnect_report = (int(match.group(1)), line)
-                last_reconnect_report_time = time.monotonic()
+    global last_esp32_contact, esp32_uptime_s, esp32_gesture_count
+    global esp32_boot_reason, esp32_last_disconnect_reason, reconnects_this_session, messages_received
+
+    for line in link.read_lines():
+        last_esp32_contact = time.monotonic()
+        messages_received += 1
+        print(f"[ESP32] {line}")
+        is_conn = _is_connection_related(line)
+        esp32_log.append((line, is_conn))
+        if is_conn:
+            conn_logger.info(f"[ESP32] {line}")
+
+        m = HEARTBEAT_RE.match(line)
+        if m:
+            esp32_uptime_s = int(m.group(1))
+            esp32_gesture_count = int(m.group(2))
+            continue
+
+        m = BOOT_RE.match(line) or RESET_REASON_RE.match(line)
+        if m:
+            esp32_boot_reason = m.group(1)
+
+        if transport.RECONNECT_REPORT_RE.match(line):
+            reconnects_this_session += 1
+            m2 = LAST_DISCONNECT_RE.search(line)
+            if m2:
+                esp32_last_disconnect_reason = m2.group(1)
 
 
 def esp32_seems_connected():
@@ -349,6 +304,7 @@ def ensure_model():
     print("Downloading hand gesture recognizer model (one-time, ~8MB)...")
     partial_path = MODEL_PATH + ".part"
     try:
+        import urllib.request
         urllib.request.urlretrieve(MODEL_URL, partial_path)
         os.replace(partial_path, MODEL_PATH)
         print("Model downloaded to", MODEL_PATH)
@@ -462,7 +418,7 @@ class GestureDebouncer:
     """Require the same label on N consecutive frames before it counts.
 
     Filters single-frame misclassifications and brief tracking dropouts so
-    they don't chatter the ESP32 WiFi link.
+    they don't chatter the ESP32 link.
     """
 
     def __init__(self, stable_frames):
@@ -480,6 +436,10 @@ class GestureDebouncer:
         if self._run_length >= self.stable_frames:
             self._confirmed = self._candidate
         return self._confirmed
+
+    def progress(self):
+        """(candidate, run_length) for the debug dashboard."""
+        return self._candidate, self._run_length
 
 
 # Hand connections for drawing (pairs of landmark indices), same topology
@@ -504,14 +464,25 @@ def draw_landmarks(frame, landmarks, w, h):
 
 
 def main():
-    ensure_model()
-    open_esp32_link()
-    atexit.register(close_esp32_link)
+    global link
 
-    conn_logger.info(f"Session started. Connection events for {ESP32_HOST} logged to {CONNECTION_LOG_PATH}")
-    ping_thread = threading.Thread(target=ping_monitor_loop, daemon=True)
-    ping_thread.start()
-    atexit.register(_ping_stop.set)
+    ensure_model()
+
+    link = create_transport()
+    link.open()
+    atexit.register(link.close)
+
+    sprite_cache, sprite_statuses = sprites.load_all_sprites()
+    print(f"Sprites loaded from {sprites.SPRITE_DIR}:")
+    for label, status in sprite_statuses.items():
+        print(f"  {label:12s} {status}")
+
+    dash = dashboard.Dashboard.create()
+    if dash is not None:
+        atexit.register(dash.destroy)
+
+    conn_logger.info(f"Session started. Transport={TRANSPORT}. "
+                      f"Connection events logged to {CONNECTION_LOG_PATH}")
 
     base_options = mp_python.BaseOptions(model_asset_path=MODEL_PATH)
     options = vision.GestureRecognizerOptions(
@@ -535,20 +506,52 @@ def main():
     start_time = time.perf_counter()
     last_timestamp_ms = 0
     last_sent_gesture = None
+    last_sent_time = None
+    last_sent_kind = None
+    last_frame_send_time = 0.0
+    current_preview_rgb = None
+    current_fallback_color = None
     esp32_was_connected = False  # tracks the previous frame's state, to log the transition once
     esp32_ever_dropped = False  # guards the "reachable again" log so it doesn't fire on first-ever contact
     debouncer = GestureDebouncer(GESTURE_STABLE_FRAMES)
+    fps = 0.0
+    frame_ms = 0.0
+    fps_window_start = time.perf_counter()
+    fps_frame_count = 0
+
+    def dispatch(label):
+        """Send `label` now (a sprite frame if one is loaded, else the
+        original plain-label datagram/message) and update all the
+        bookkeeping the refresh timer and dashboard need."""
+        nonlocal last_sent_gesture, last_sent_time, last_sent_kind
+        nonlocal current_preview_rgb, current_fallback_color, last_frame_send_time
+        rgb = sprite_cache.get(label)
+        if rgb is not None:
+            payload = sprites.encode_frame(label, rgb)
+            kind = "FRAME"
+        else:
+            payload = f"{label}\n".encode("utf-8")
+            kind = "LABEL (fallback color)"
+        link.send(payload)
+        print(f"Sent gesture '{label}' via {TRANSPORT} ({kind})")
+        last_sent_gesture = label
+        last_sent_time = time.monotonic()
+        last_sent_kind = kind
+        last_frame_send_time = last_sent_time
+        current_preview_rgb = rgb
+        current_fallback_color = sprites.FALLBACK_COLORS.get(label, (0, 0, 0))
 
     try:
         while cap.isOpened():
+            loop_start = time.perf_counter()
             success, frame = cap.read()
             if not success:
                 print("Ignoring empty camera frame.")
                 continue
 
             frame = cv2.flip(frame, 1)  # mirror for natural interaction
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
 
             h, w, _ = frame.shape
             aspect = w / h
@@ -592,22 +595,28 @@ def main():
 
             confirmed = debouncer.update(esp32_gesture)
             if confirmed is not None and confirmed != last_sent_gesture:
-                send_gesture(confirmed)
-                last_sent_gesture = confirmed
+                dispatch(confirmed)
+            elif last_sent_gesture is not None and time.monotonic() - last_frame_send_time >= FRAME_REFRESH_S:
+                dispatch(last_sent_gesture)  # idempotent refresh -- see FRAME_REFRESH_S
 
             read_esp32_output()
 
             esp32_connected = esp32_seems_connected()
             if esp32_connected is False and esp32_was_connected:
-                msg = f"ESP32 has not responded in over {ESP32_TIMEOUT_S:.0f}s -- check its WiFi connection and power."
+                msg = f"ESP32 has not responded in over {ESP32_TIMEOUT_S:.0f}s -- check its connection and power."
                 print(f"Warning: {msg}")
-                conn_logger.warning(f"[UDP] {msg}")
+                conn_logger.warning(f"[{TRANSPORT.upper()}] {msg}")
                 esp32_ever_dropped = True
-            elif esp32_connected and not esp32_was_connected and esp32_ever_dropped:
-                # Guarded by esp32_ever_dropped so this doesn't fire on the
-                # very first contact of the session (not a "recovery").
-                conn_logger.info("[UDP] ESP32 reachable again")
-                esp32_ever_dropped = False
+            elif esp32_connected and not esp32_was_connected:
+                if esp32_ever_dropped:
+                    # Guarded by esp32_ever_dropped so this doesn't fire on the
+                    # very first contact of the session (not a "recovery").
+                    conn_logger.info(f"[{TRANSPORT.upper()}] ESP32 reachable again")
+                    esp32_ever_dropped = False
+                if last_sent_gesture is not None:
+                    # Restore the panel right away instead of waiting up to
+                    # FRAME_REFRESH_S after a reconnect.
+                    dispatch(last_sent_gesture)
             esp32_was_connected = bool(esp32_connected)
 
             if esp32_connected is None:
@@ -615,18 +624,21 @@ def main():
             elif esp32_connected:
                 status_text, status_color = f"ESP32: {last_sent_gesture or '...'}", (0, 200, 255)
                 # Briefly show the ESP32's own reconnect telemetry (real
-                # attempt count + downtime) right after it comes back.
-                if (last_reconnect_report_time is not None
-                        and time.monotonic() - last_reconnect_report_time < RECONNECT_NOTE_DISPLAY_S):
-                    attempts, _msg = last_reconnect_report
+                # attempt count + downtime) right after it comes back --
+                # only tracked over the UDP transport.
+                report_time = getattr(link, "last_reconnect_report_time", None)
+                if report_time is not None and time.monotonic() - report_time < RECONNECT_NOTE_DISPLAY_S:
+                    attempts, _msg = link.last_reconnect_report
                     status_text += f" (reconnected after {attempts} attempt(s))"
             else:
                 downtime_s = time.monotonic() - last_esp32_contact
-                # No network path exists to ask the ESP32 for its real
-                # attempt count while it's down, so estimate from elapsed
-                # downtime and its known retry interval.
                 est_attempts = int(downtime_s // ESP32_RECONNECT_INTERVAL_S)
-                status_text = f"ESP32: UNREACHABLE ({downtime_s:.0f}s, ~{est_attempts} reconnect attempts)"
+                status_text = f"ESP32: UNREACHABLE ({downtime_s:.0f}s)"
+                if TRANSPORT == "udp":
+                    # No network path exists to ask the ESP32 for its real
+                    # attempt count while WiFi is down, so estimate from
+                    # elapsed downtime and its known retry interval.
+                    status_text = f"ESP32: UNREACHABLE ({downtime_s:.0f}s, ~{est_attempts} reconnect attempts)"
                 status_color = (0, 0, 255)  # BGR red
 
             cv2.putText(
@@ -640,9 +652,71 @@ def main():
                 cv2.LINE_AA,
             )
 
-            cv2.imshow("Gesture Detection (press 'q' to quit)", frame)
-            if cv2.waitKey(5) & 0xFF == ord("q"):
+            cv2.imshow("Gesture Detection (press 'q' to quit, 'r' to reload sprites)", frame)
+
+            fps_frame_count += 1
+            now = time.perf_counter()
+            if now - fps_window_start >= 1.0:
+                fps = fps_frame_count / (now - fps_window_start)
+                fps_frame_count = 0
+                fps_window_start = now
+            frame_ms = (time.perf_counter() - loop_start) * 1000
+
+            if dash is not None and not dash.closed:
+                link_status = link.status()
+                reconnect_report = link_status.get("last_reconnect_report")
+                candidate, run_length = debouncer.progress()
+                state = dashboard.DashboardState(
+                    transport_name=link_status.get("transport", TRANSPORT),
+                    transport_address=link_status.get("address", "?"),
+                    transport_open=link_status.get("open", False),
+                    transport_reopen_attempts=link_status.get("reopen_attempts", 0),
+                    transport_last_error=link_status.get("last_error"),
+                    frames_sent=link_status.get("frames_sent", 0),
+                    bytes_sent=link_status.get("bytes_sent", 0),
+                    heartbeat_state=esp32_connected,
+                    last_contact_age_s=(time.monotonic() - last_esp32_contact) if last_esp32_contact else None,
+                    downtime_s=(time.monotonic() - last_esp32_contact)
+                    if (esp32_connected is False and last_esp32_contact) else None,
+                    ping_ok=link_status.get("ping_ok"),
+                    reconnects_this_session=reconnects_this_session,
+                    last_reconnect_report=reconnect_report[1] if reconnect_report else None,
+                    last_disconnect_reason=esp32_last_disconnect_reason,
+                    esp32_uptime_s=esp32_uptime_s,
+                    esp32_gesture_count=esp32_gesture_count,
+                    esp32_boot_reason=esp32_boot_reason,
+                    raw_label=esp32_gesture,
+                    debounce_candidate=candidate,
+                    debounce_run_length=run_length,
+                    debounce_stable_frames=GESTURE_STABLE_FRAMES,
+                    confirmed_label=confirmed,
+                    last_sent_label=last_sent_gesture,
+                    last_sent_age_s=(time.monotonic() - last_sent_time) if last_sent_time else None,
+                    send_kind=last_sent_kind,
+                    sprite_statuses=sprite_statuses,
+                    preview_rgb=current_preview_rgb,
+                    preview_fallback_color=current_fallback_color,
+                    fps=fps,
+                    frame_ms=frame_ms,
+                    messages_sent=link_status.get("frames_sent", 0),
+                    messages_received=messages_received,
+                    log_lines=list(esp32_log),
+                )
+                dash.update(state)
+                if dash.consume_reload_request():
+                    sprite_cache, sprite_statuses = sprites.load_all_sprites()
+                    print("Sprites reloaded.")
+                    if last_sent_gesture is not None:
+                        dispatch(last_sent_gesture)
+
+            key = cv2.waitKey(5) & 0xFF
+            if key == ord("q"):
                 break
+            elif key == ord("r"):
+                sprite_cache, sprite_statuses = sprites.load_all_sprites()
+                print("Sprites reloaded.")
+                if last_sent_gesture is not None:
+                    dispatch(last_sent_gesture)
     except KeyboardInterrupt:
         print("Interrupted, shutting down.")
     finally:
@@ -650,7 +724,9 @@ def main():
         cap.release()
         cv2.destroyAllWindows()
         read_esp32_output()  # flush any remaining buffered ESP32 messages
-        close_esp32_link()
+        link.close()
+        if dash is not None:
+            dash.destroy()
 
 
 if __name__ == "__main__":
