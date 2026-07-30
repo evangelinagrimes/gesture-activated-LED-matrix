@@ -500,6 +500,8 @@ def main():
     )
     recognizer = vision.GestureRecognizer.create_from_options(options)
 
+    WINDOW_NAME = "Gesture Detection (press 'q' or close window to quit, 'r' to reload sprites)"
+
     # CAP_DSHOW avoids a multi-second startup stall the default MSMF backend
     # is prone to on Windows.
     cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
@@ -658,7 +660,7 @@ def main():
                 cv2.LINE_AA,
             )
 
-            cv2.imshow("Gesture Detection (press 'q' to quit, 'r' to reload sprites)", frame)
+            cv2.imshow(WINDOW_NAME, frame)
 
             fps_frame_count += 1
             now = time.perf_counter()
@@ -716,7 +718,12 @@ def main():
                         dispatch(last_sent_gesture)
 
             key = cv2.waitKey(5) & 0xFF
-            if key == ord("q"):
+            # cv2's window close ("X") button doesn't generate a key event --
+            # waitKey() only pumps the GUI event queue so the window's
+            # visibility property reflects the click. WND_PROP_VISIBLE reads
+            # < 1 once the user has closed the window, which is the standard
+            # way to detect that with OpenCV's highgui backend.
+            if key == ord("q") or cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
                 break
             elif key == ord("r"):
                 sprite_cache, sprite_statuses = sprites.load_all_sprites()
