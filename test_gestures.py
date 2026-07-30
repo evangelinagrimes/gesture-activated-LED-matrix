@@ -88,6 +88,10 @@ class ClassifyGestureTests(unittest.TestCase):
         hand = make_hand(index=True)
         self.assertEqual(gesture.classify_gesture(hand), "Pointing")
 
+    def test_middle_finger(self):
+        hand = make_hand(middle=True)
+        self.assertEqual(gesture.classify_gesture(hand), "Middle Finger")
+
     def test_rock_on(self):
         hand = make_hand(thumb=True, pinky=True)
         self.assertEqual(gesture.classify_gesture(hand), "Rock On")
@@ -145,6 +149,7 @@ class AspectInvarianceTests(unittest.TestCase):
         ("Open Palm", dict(thumb=True, index=True, middle=True, ring=True, pinky=True)),
         ("Peace Sign", dict(index=True, middle=True)),
         ("Pointing", dict(index=True)),
+        ("Middle Finger", dict(middle=True)),
         ("Rock On", dict(thumb=True, pinky=True)),
     ]
 
@@ -208,6 +213,19 @@ class ResolveGestureTests(unittest.TestCase):
         label, text = gesture.resolve_gesture([self.Category("Thumb_Up", 0.1)], fist)
         self.assertEqual(label, "fist")
         self.assertEqual(text, "Fist")
+
+    def test_ok_sign_maps_to_wire_label(self):
+        hand = make_hand(thumb=False, index=False, middle=True, ring=True, pinky=True)
+        hand[4] = LM(hand[8].x - 0.02, hand[8].y + 0.01)
+        label, text = gesture.resolve_gesture([], hand)
+        self.assertEqual(label, "ok_sign")
+        self.assertEqual(text, "OK Sign")
+
+    def test_middle_finger_maps_to_wire_label(self):
+        hand = make_hand(middle=True)
+        label, text = gesture.resolve_gesture([], hand)
+        self.assertEqual(label, "middle_finger")
+        self.assertEqual(text, "Middle Finger")
 
 
 class PickDrivingHandTests(unittest.TestCase):

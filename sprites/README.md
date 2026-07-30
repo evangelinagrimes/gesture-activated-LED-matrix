@@ -2,7 +2,7 @@
 
 One file per gesture label, named `<label>.<ext>`. The labels that matter
 are the wire label set from `gesture.py`: `thumbs_up`, `thumbs_down`,
-`peace`, `open_palm`, `fist`, and `none`.
+`peace`, `open_palm`, `fist`, `ok_sign`, `middle_finger`, and `none`.
 
 A label with no file here just falls back to the original flat-color
 behavior (`processGesture()` in `gesture-esp.ino`), so it's fine to add
@@ -52,10 +52,11 @@ no ESP32 or webcam required. Re-run it after adding or editing a file.
 
 ## What's here now
 
-The five `.hex` files in this folder are placeholder pixel art (not real
+The seven `.hex` files in this folder are placeholder pixel art (not real
 photos) -- a thumb-and-fist shape for thumbs_up/thumbs_down, a V-sign for
-peace, a splayed hand for open_palm, a rounded blob for fist -- so the
-whole pipeline (load, encode, transport, render) is testable with
-something recognizable before real artwork exists. They reuse the same
-colors as the original flat-color fallback (green/red/blue/white/orange).
+peace, a splayed hand for open_palm, a rounded blob for fist, a ring for
+ok_sign, a raised finger over a fist for middle_finger -- so the whole
+pipeline (load, encode, transport, render) is testable with something
+recognizable before real artwork exists. They reuse the same colors as the
+original flat-color fallback (green/red/blue/white/orange/yellow/purple).
 Replace them freely -- see the formats above.

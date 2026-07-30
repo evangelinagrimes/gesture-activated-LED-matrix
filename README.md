@@ -28,7 +28,7 @@ classifies the hand in frame using a hybrid approach:
 2. Anything the pretrained model doesn't recognize (or isn't confident
    about) falls back to hand-written geometric rules in
    `classify_gesture()`, which also covers a few gestures the pretrained
-   model has no category for: Pointing, OK Sign, Rock On.
+   model has no category for: Pointing, OK Sign, Rock On, Middle Finger.
 
 A gesture has to hold steady for `GESTURE_STABLE_FRAMES` consecutive frames
 (`GestureDebouncer`) before it's sent, so a single misclassified frame
@@ -48,21 +48,23 @@ Each gesture label looks up a 16x16 image in `sprites/` (`thumbs_up.png`,
 `fist.hex`, etc.) and streams it to the ESP32 pixel-for-pixel. A label with
 no sprite file falls back to the original flat-color behavior:
 
-| Gesture       | Sprite file (if present)  | Fallback color (if not) |
-|---------------|----------------------------|--------------------------|
-| `thumbs_up`   | `sprites/thumbs_up.*`      | Green                    |
-| `thumbs_down` | `sprites/thumbs_down.*`    | Red                      |
-| `peace`       | `sprites/peace.*`          | Blue                     |
-| `open_palm`   | `sprites/open_palm.*`      | White                    |
-| `fist`        | `sprites/fist.*`           | Orange                   |
-| `none`        | `sprites/none.*`           | Off                      |
+| Gesture         | Sprite file (if present)    | Fallback color (if not) |
+|-----------------|-------------------------------|--------------------------|
+| `thumbs_up`     | `sprites/thumbs_up.*`         | Green                    |
+| `thumbs_down`   | `sprites/thumbs_down.*`       | Red                      |
+| `peace`         | `sprites/peace.*`             | Blue                     |
+| `open_palm`     | `sprites/open_palm.*`         | White                    |
+| `fist`          | `sprites/fist.*`              | Orange                   |
+| `ok_sign`       | `sprites/ok_sign.*`           | Yellow                   |
+| `middle_finger` | `sprites/middle_finger.*`     | Purple                   |
+| `none`          | `sprites/none.*`              | Off                      |
 
-Gestures the ESP32 doesn't recognize (`Pointing`, `OK Sign`, `Rock On`,
-`Unknown`) are sent as `none`. See [sprites/README.md](sprites/README.md)
-for the two supported file formats (image or hand-authored hex text) and
-how to check new artwork with `python -m sprites` before plugging anything
-in. The repo ships placeholder `.hex` pixel art for all five gestures so
-the whole pipeline works out of the box -- drop a same-named `.png` in next
+Gestures the ESP32 doesn't recognize (`Pointing`, `Rock On`, `Unknown`) are
+sent as `none`. See [sprites/README.md](sprites/README.md) for the two
+supported file formats (image or hand-authored hex text) and how to check
+new artwork with `python -m sprites` before plugging anything in. The repo
+ships placeholder `.hex` pixel art for all seven gestures so the whole
+pipeline works out of the box -- drop a same-named `.png` in next
 to one to replace it, no code change or reflash needed.
 
 ## Transports

@@ -26,11 +26,11 @@ handles Thumbs Up, Thumbs Down, Peace Sign, Open Palm, and Fist (each with
 a confidence score, gated by MIN_GESTURE_CONFIDENCE below). Anything it
 doesn't recognize falls back to hand-written geometric rules in
 `classify_gesture()`, which also cover a few extra gestures the pretrained
-model has no category for: Pointing, OK Sign, Rock On.
+model has no category for: Pointing, OK Sign, Rock On, Middle Finger.
 
 You can extend `classify_gesture()` with your own logic/gestures.
 
---------------------------------------------------------------------------qqqqq
+--------------------------------------------------------------------------
 ESP32 transport: USB serial (default) or WiFi UDP
 --------------------------------------------------------------------------
 Set TRANSPORT below to pick the link. "serial" (default) talks to the
@@ -57,13 +57,15 @@ Keep the label set in sync with whatever the ESP32 firmware switches on:
     peace
     open_palm
     fist
+    ok_sign
+    middle_finger
     none
 
 Any gesture classified by `classify_gesture()` that isn't one of the
-above (e.g. "Pointing", "OK Sign", "Rock On", "Unknown") is reported to
-the ESP32 as "none". A gesture must hold steady for GESTURE_STABLE_FRAMES
-consecutive frames before it is sent, to avoid chattering the link on
-single-frame misclassifications.
+above (e.g. "Pointing", "Rock On", "Unknown") is reported to the ESP32 as
+"none". A gesture must hold steady for GESTURE_STABLE_FRAMES consecutive
+frames before it is sent, to avoid chattering the link on single-frame
+misclassifications.
 
 Status/debug lines the ESP32 sends back (heartbeats, boot/reset reason,
 WiFi reconnect reports) are printed with an "[ESP32]" prefix and surfaced
@@ -178,14 +180,16 @@ MP_GESTURE_LABELS = {
 }
 
 # Maps classify_gesture() output to the label strings the ESP32 expects.
-# Anything not listed here (e.g. "Pointing", "OK Sign", "Rock On",
-# "Unknown") is sent as "none".
+# Anything not listed here (e.g. "Pointing", "Rock On", "Unknown") is sent
+# as "none".
 GESTURE_LABELS = {
     "Thumbs Up": "thumbs_up",
     "Thumbs Down": "thumbs_down",
     "Peace Sign": "peace",
     "Open Palm": "open_palm",
     "Fist": "fist",
+    "OK Sign": "ok_sign",
+    "Middle Finger": "middle_finger",
 }
 
 link = None  # the active Transport instance, set in main()
@@ -373,6 +377,8 @@ def classify_gesture(landmarks, aspect=1.0):
         return "Peace Sign"
     if index and not middle and not ring and not pinky and not thumb:
         return "Pointing"
+    if middle and not thumb and not index and not ring and not pinky:
+        return "Middle Finger"
     if thumb and pinky and not index and not middle and not ring:
         return "Rock On"
     if thumb and not index and not middle and not ring and not pinky:
@@ -394,7 +400,7 @@ def resolve_gesture(gestures, landmarks, aspect=1.0):
 
     Prefers the pretrained recognizer when it is confident; otherwise falls
     back to the geometric rules, which cover the gestures it has no category
-    for (OK Sign, Rock On, Pointing).
+    for (OK Sign, Rock On, Pointing, Middle Finger).
     """
     if gestures:
         top = gestures[0]  # highest-scoring category for this hand

@@ -39,7 +39,8 @@ SPRITE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sprites")
 # plus "none". A missing "none" sprite is fine -- it falls back to the
 # existing off/black behavior, which is what a driving hand with no
 # recognized gesture already does today.
-DEFAULT_LABELS = ("thumbs_up", "thumbs_down", "peace", "open_palm", "fist", "none")
+DEFAULT_LABELS = ("thumbs_up", "thumbs_down", "peace", "open_palm", "fist",
+                   "ok_sign", "middle_finger", "none")
 
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".gif")
 HEX_EXTS = (".hex", ".txt")
@@ -59,6 +60,8 @@ FALLBACK_COLORS = {
     "peace": (0, 0, 255),
     "open_palm": (255, 255, 255),
     "fist": (255, 165, 0),
+    "ok_sign": (255, 255, 0),
+    "middle_finger": (128, 0, 255),
     "none": (0, 0, 0),
 }
 

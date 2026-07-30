@@ -287,6 +287,10 @@ void processGesture(String gesture) {
     setColor(255, 255, 255);
   } else if (gesture == "fist") {
     setColor(255, 165, 0);
+  } else if (gesture == "ok_sign") {
+    setColor(255, 255, 0);   // yellow
+  } else if (gesture == "middle_finger") {
+    setColor(128, 0, 255);   // purple -- R!=B, so distinct from the reconnect pulse's pure magenta (R==B, G==0)
   } else if (gesture == "none") {
     setColor(0, 0, 0);
   } else if (gesture == "test") {

@@ -1,0 +1,18 @@
+# Placeholder sprite: ok_sign (16x16, yellow ring). Replace with
+# ok_sign.png for real artwork -- see sprites/README.md.
+. . . . . . FFFF00 FFFF00 FFFF00 FFFF00 . . . . . .
+. . . . FFFF00 FFFF00 . . . . FFFF00 FFFF00 . . . .
+. . . FFFF00 . . . . . . . . FFFF00 . . .
+. . FFFF00 . . . . . . . . . . FFFF00 . .
+. FFFF00 . . . . . . . . . . . . FFFF00 .
+FFFF00 . . . . . . . . . . . . . . FFFF00
+FFFF00 . . . . . . . . . . . . . . FFFF00
+FFFF00 . . . . . . . . . . . . . . FFFF00
+FFFF00 . . . . . . . . . . . . . . FFFF00
+FFFF00 . . . . . . . . . . . . . . FFFF00
+FFFF00 . . . . . . . . . . . . . . FFFF00
+. FFFF00 . . . . . . . . . . . . FFFF00 .
+. . FFFF00 . . . . . . . . . . FFFF00 . .
+. . . FFFF00 . . . . . . . . FFFF00 . . .
+. . . . FFFF00 FFFF00 . . . . FFFF00 FFFF00 . . . .
+. . . . . . FFFF00 FFFF00 FFFF00 FFFF00 . . . . . .
